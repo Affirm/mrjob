@@ -278,7 +278,9 @@ class LocalMRJobRunner(SimMRJobRunner):
             # just pass one line at a time to parse_mr_job_stderr(),
             # so we can print error and status messages in realtime
             parsed = parse_mr_job_stderr(
-                [line], counters=self._counters[step_num])
+                # decode line using UTF-8, since parse_mr_job_stderr expects unicode strings
+                # without this change, log lines from subprocesses containing UTF-8 bytes do not get printed properly
+                [line.decode('utf-8')], counters=self._counters[step_num])
 
             # in practice there's only going to be at most one line in
             # one of these lists, but the code is cleaner this way
