@@ -519,9 +519,9 @@ _RUNNER_OPTS = dict(
         switches=[
             (['--cmdenv'], dict(
                 action=_KeyValueAction,
-                help=('Set an environment variable for your job inside Hadoop '
-                      'streaming. Must take the form KEY=VALUE. You can use'
-                      ' --cmdenv multiple times.'),
+                help=('Set an environment variable for your job inside Hadoop'
+                      ' streaming and spark. Must take the form KEY=VALUE. You'
+                      ' can use --cmdenv multiple times.'),
             )),
         ],
     ),
@@ -895,6 +895,22 @@ _RUNNER_OPTS = dict(
         switches=[
             (['--master-instance-type'], dict(
                 help='Type of GCE/EC2 master instance to launch',
+            )),
+        ],
+    ),
+    master_setup=dict(
+        combiner=combine_lists,
+        switches=[
+            (['--master-setup'], dict(
+                action='append',
+                help=('A command or list of shell commands to run before each'
+                      ' step in EMR (e.g. "touch foo"). Files included in'
+                      ' upload_files are copied over to the working directory'
+                      ' that the script runs from only if they are referenced'
+                      ' (relative to the working dir) in a command in the'
+                      ' list. References to upload_archives are not supported.'
+                      ' Variables set in the cmdenv options are set for'
+                      ' commands in the script.'),
             )),
         ],
     ),
