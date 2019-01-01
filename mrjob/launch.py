@@ -472,6 +472,10 @@ class MRJobLauncher(object):
             from mrjob.emr import EMRJobRunner
             return EMRJobRunner
 
+        elif self.options.runner == 'yarnemr':
+            from mrjob.yarnemr import YarnEMRJobRunner
+            return YarnEMRJobRunner
+
         elif self.options.runner == 'hadoop':
             from mrjob.hadoop import HadoopJobRunner
             return HadoopJobRunner
