@@ -24,6 +24,7 @@ log = logging.getLogger(__name__)
 _DEFAULT_BACKOFF = 15
 _DEFAULT_MULTIPLIER = 1.5
 _DEFAULT_MAX_TRIES = 10
+_DEFAULT_MAX_BACKOFF = 1200  # 20 minutes
 
 
 class RetryWrapper(object):
@@ -38,7 +39,8 @@ class RetryWrapper(object):
     def __init__(self, wrapped, retry_if,
                  backoff=_DEFAULT_BACKOFF,
                  multiplier=_DEFAULT_MULTIPLIER,
-                 max_tries=_DEFAULT_MAX_TRIES):
+                 max_tries=_DEFAULT_MAX_TRIES,
+                 max_backoff=_DEFAULT_MAX_BACKOFF):
         """
         Wrap the given object
 
@@ -54,6 +56,8 @@ class RetryWrapper(object):
         :type max_tries: int
         :param max_tries: how many tries we get. ``0`` means to keep trying
                           forever
+        :type max_backoff: float
+        :param max_backoff: cap the backoff at this number of seconds
         """
         self.__wrapped = wrapped
 
@@ -68,6 +72,19 @@ class RetryWrapper(object):
             raise ValueError('multiplier must be at least one!')
 
         self.__max_tries = max_tries
+
+        self.__max_backoff = max_backoff
+
+    def __iter__(self):
+        """The paginator uses `_make_request` to make any API calls, so we
+        wrap this method manually in our retry logic and pass the iteration
+        back to the paginator."""
+        if hasattr(self.__wrapped, '__iter__'):
+            self.__wrapped._make_request = \
+                self.__wrap_method_with_call_and_maybe_retry(
+                    self.__wrapped._make_request)
+            return self.__wrapped.__iter__()
+        raise Exception('Not iterable')
 
     def __getattr__(self, name):
         """The glue that makes functions retriable, and returns other
@@ -98,6 +115,7 @@ class RetryWrapper(object):
                         time.sleep(backoff)
                         tries += 1
                         backoff *= self.__multiplier
+                        backoff = min(backoff, self.__max_backoff)
                     else:
                         raise
 
