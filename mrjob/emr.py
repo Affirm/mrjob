@@ -308,6 +308,7 @@ class EMRJobRunner(HadoopInTheCloudJobRunner, LogInterpretationMixin):
         'aws_session_token',
         'bootstrap_actions',
         'bootstrap_spark',
+        'bypass_pool_wait',
         'cloud_log_dir',
         'core_instance_bid_price',
         'ebs_root_volume_gb',
@@ -453,6 +454,7 @@ class EMRJobRunner(HadoopInTheCloudJobRunner, LogInterpretationMixin):
             super(EMRJobRunner, self)._default_opts(),
             dict(
                 bootstrap_python=None,
+                bypass_pool_wait=False,
                 check_cluster_every=30,
                 cleanup_on_failure=['JOB'],
                 cloud_fs_sync_secs=5.0,
@@ -2553,7 +2555,8 @@ class EMRJobRunner(HadoopInTheCloudJobRunner, LogInterpretationMixin):
         log.debug('    OK - valid cluster state')
         return len(steps)
 
-    def _usable_clusters(self, exclude=set(), num_steps=1):
+    def _usable_clusters(self, valid_clusters, invalid_clusters,
+                         locked_clusters, num_steps):
         """Get clusters that this runner can join, returning a list of
         ``(cluster_id, num_steps)`` (number of steps is used for locking).
 
@@ -2562,9 +2565,19 @@ class EMRJobRunner(HadoopInTheCloudJobRunner, LogInterpretationMixin):
         - total compute units for master node
         - time left to an even instance hour
 
-        The most desirable clusters come *last* in the list.
+        Note: this will update pass-by-reference arguments `valid_clusters`
+        and `invalid_clusters`.
 
-        :return: tuple of (cluster_id, num_steps_in_cluster)
+        :param valid_clusters: A map of cluster id to cluster info with a valid
+                               setup; thus we do not need to check their setup
+                               again.
+        :param invalid_clusters: A set of clusters with an invalid setup; thus
+                                 we skip these clusters.
+        :param locked_clusters: A set of clusters managed by the callee that
+                                are in a "locked" state.
+        :param num_steps: The number of steps this job requires.
+
+        :return: list of tuples of (cluster_id, num_steps_in_cluster)
         """
         emr_client = self.make_emr_client()
         req_pool_hash = self._pool_hash()
@@ -2578,21 +2591,29 @@ class EMRJobRunner(HadoopInTheCloudJobRunner, LogInterpretationMixin):
             cluster_id = cluster_summary['Id']
 
             # this may be a retry due to locked clusters
-            if cluster_id in exclude:
+            if cluster_id in invalid_clusters or cluster_id in locked_clusters:
                 log.debug('    excluded')
                 continue
 
-            cluster = emr_client.describe_cluster(
-                ClusterId=cluster_id)['Cluster']
+            # if we haven't seen this cluster before then check the setup
+            cluster, instance_sort_key = valid_clusters.get(cluster_id,
+                                                            (None, None,))
+            if cluster is None:
+                cluster = emr_client.describe_cluster(
+                    ClusterId=cluster_id)['Cluster']
+                instance_sort_key = self._compare_cluster_setup(
+                        emr_client, cluster, req_pool_hash)
+                if not instance_sort_key:
+                    invalid_clusters.add(cluster_id)
+                    continue
+                valid_clusters[cluster_id] = (cluster, instance_sort_key,)
 
-            instance_sort_key = self._compare_cluster_setup(
-                emr_client, cluster, req_pool_hash)
-            if not instance_sort_key:
-                continue
-
+            # always check the cluster state
             num_steps_in_cluster = self._check_cluster_state(
                 emr_client, cluster, num_steps)
             if num_steps_in_cluster == -1:
+                # don't add to invalid cluster list since the cluster may
+                # be valid when we next check
                 continue
 
             key_cluster_steps_list.append(
@@ -2607,45 +2628,52 @@ class EMRJobRunner(HadoopInTheCloudJobRunner, LogInterpretationMixin):
         compute units. Break ties by choosing cluster with longest idle time.
         Return ``None`` if no suitable clusters exist.
         """
-        exclude = set()
+        valid_clusters = {}
+        invalid_clusters = set()
+        locked_clusters = set()
+
         max_wait_time = self._opts['pool_wait_minutes']
+        bypass_pool_wait = self._opts['bypass_pool_wait']
         now = datetime.now()
         end_time = now + timedelta(minutes=max_wait_time)
-        time_sleep = timedelta(seconds=_POOLING_SLEEP_INTERVAL)
 
         log.info('Attempting to find an available cluster...')
         while now <= end_time:
             cluster_info_list = self._usable_clusters(
-                exclude=exclude,
-                num_steps=num_steps)
+                valid_clusters, invalid_clusters,
+                locked_clusters, num_steps)
             log.debug(
                 '  Found %d usable clusters%s%s' % (
                     len(cluster_info_list),
                     ': ' if cluster_info_list else '',
                     ', '.join(c for c, n in reversed(cluster_info_list))))
+
             if cluster_info_list:
-                cluster_id, num_steps = cluster_info_list[-1]
+                cluster_id, cluster_num_steps = cluster_info_list[-1]
                 status = _attempt_to_acquire_lock(
-                    self.fs, self._lock_uri(cluster_id, num_steps),
+                    self.fs, self._lock_uri(cluster_id, cluster_num_steps),
                     self._opts['cloud_fs_sync_secs'], self._job_key)
                 if status:
                     log.debug('Acquired lock on cluster %s', cluster_id)
                     return cluster_id
                 else:
                     log.debug("Can't acquire lock on cluster %s", cluster_id)
-                    exclude.add(cluster_id)
+                    locked_clusters.add(cluster_id)
+            elif bypass_pool_wait and not valid_clusters:
+                return None
             elif max_wait_time == 0:
                 return None
             else:
                 # Reset the exclusion set since it is possible to reclaim a
                 # lock that was previously unavailable.
-                exclude = set()
+                locked_clusters = set()
                 log.info('No clusters available in pool %r. Checking again'
                          ' in %d seconds...' % (
                              self._opts['pool_name'],
                              int(_POOLING_SLEEP_INTERVAL)))
                 time.sleep(_POOLING_SLEEP_INTERVAL)
-                now += time_sleep
+                now += timedelta(seconds=_POOLING_SLEEP_INTERVAL)
+
         return None
 
     def _lock_uri(self, cluster_id, num_steps):
