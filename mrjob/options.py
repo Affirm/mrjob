@@ -519,9 +519,12 @@ _RUNNER_OPTS = dict(
         switches=[
             (['--cmdenv'], dict(
                 action=_KeyValueAction,
-                help=('Set an environment variable for your job inside Hadoop'
-                      ' streaming and spark. Must take the form KEY=VALUE. You'
-                      ' can use --cmdenv multiple times.'),
+                help=('Set an environment variable for inside Hadoop streaming'
+                      ' and spark jobs. Options must take the form KEY=VALUE.'
+                      ' You can use --cmdenv multiple times. The value may'
+                      ' also contain a single "%s" which will be interpolated'
+                      ' by the unique mrjob job key for each job; thus'
+                      ' parameterizing this value for each run.'),
             )),
         ],
     ),
@@ -1152,7 +1155,8 @@ _RUNNER_OPTS = dict(
             (['--spark-args'], dict(
                 action=_AppendArgsAction,
                 help=('One or more arguments to pass to spark-submit'
-                      ' (e.g. --spark-args="--properties-file my.conf").'),
+                      ' (e.g. --spark-args="--properties-file my.conf").'
+                      ' Variables set in `cmdenv` can be references here.'),
             )),
             (['--spark-arg'], dict(
                 action='append',
