@@ -1555,7 +1555,7 @@ class MasterBootstrapScriptTestCase(MockBoto3TestCase):
                     lines)
             else:
                 self.assertIn(
-                    '  aws s3 cp %s $__mrjob_PWD/%s' % (uri, name),
+                    '  aws s3 cp --region us-east-1 %s $__mrjob_PWD/%s' % (uri, name),
                     lines)
 
             self.assertIn(
@@ -1745,7 +1745,7 @@ class MasterBootstrapScriptTestCase(MockBoto3TestCase):
 
         self.assertIn('  __mrjob_TMP=$(mktemp -d)', lines)
 
-        self.assertIn(('  aws s3 cp %s $__mrjob_TMP/foo.tar.gz' %
+        self.assertIn(('  aws s3 cp --region us-east-1 %s $__mrjob_TMP/foo.tar.gz' %
                        runner._upload_mgr.uri(foo_tar_gz)),
                       lines)
 
@@ -1780,7 +1780,7 @@ class MasterBootstrapScriptTestCase(MockBoto3TestCase):
 
         self.assertIn('  __mrjob_TMP=$(mktemp -d)', lines)
 
-        self.assertIn(('  aws s3 cp %s $__mrjob_TMP/foo.tar.gz' %
+        self.assertIn(('  aws s3 cp --region us-east-1 %s $__mrjob_TMP/foo.tar.gz' %
                        runner._upload_mgr.uri(
                            runner._dir_archive_path(foo_dir))),
                       lines)

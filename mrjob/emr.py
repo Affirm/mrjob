@@ -2211,14 +2211,14 @@ class EMRJobRunner(HadoopInTheCloudJobRunner, LogInterpretationMixin):
         """Command to copy files from the cloud to the local directory."""
         if self._opts['release_label']:
             # on the 4.x AMIs, hadoop isn't yet installed, so use AWS CLI
-            return 'aws s3 cp'
+            return 'aws s3 cp --region us-east-1'
         else:
             # on the 2.x and 3.x AMIs, use hadoop
             return 'hadoop fs -copyToLocal'
 
     def _manifest_download_commands(self):
         return [
-            ('s3://*', 'aws s3 cp'),
+            ('s3://*', 'aws s3 cp --region us-east-1'),
             ('*://*', 'hadoop fs -copyToLocal'),
         ]
 
