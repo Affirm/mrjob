@@ -1470,8 +1470,8 @@ class EMRJobRunner(HadoopInTheCloudJobRunner, LogInterpretationMixin):
             return _PRE_4_X_STREAMING_JAR, []
 
     def _launch_emr_job(self):
-        """Create an empty cluster on EMR, and set self._cluster_id to
-        its ID.
+        """Create an empty cluster on EMR if needed, sets self._cluster_id to
+        the cluster's ID, and adds a new EMR step.
         """
         self._create_s3_tmp_bucket_if_needed()
         emr_client = self.make_emr_client()
@@ -2350,218 +2350,256 @@ class EMRJobRunner(HadoopInTheCloudJobRunner, LogInterpretationMixin):
         """Get the ID of the cluster our job is running on, or ``None``."""
         return self._cluster_id
 
-    def _usable_clusters(self, exclude=None, num_steps=1):
-        """Get clusters that this runner can join, returning a list of
-        ``(cluster_id, num_steps)`` (number of steps is used for locking).
+    def _compare_cluster_setup(self, emr_client, cluster, req_pool_hash):
+        """Check if the required configuration fields of the given cluster are
+        the same as in the requested cluster.
 
-        We basically expect to only join available clusters with the exact
-        same setup as our own, that is:
+        These checks include
 
+        - same pool name/hash
         - same bootstrap setup (including mrjob version)
-        - have the same AMI version and custom AMI ID (if any)
+        - same AMI version and custom AMI ID (if any)
         - install the same applications (if we requested any)
         - same number and type of instances
 
-        However, we allow joining clusters where for each role, every instance
+        Note: we allow joining clusters where for each role, every instance
         has at least as much memory as we require, and the total number of
         compute units is at least what we require.
 
-        There also must be room for our job in the cluster (clusters top out
-        at 256 steps).
+        :param emr_client: a boto3 EMR client. See
+                           :py:meth:`~mrjob.emr.EMRJobRunner.make_emr_client`
+        :param cluster: EMR cluster dict to check if we are able to join.
+        :param req_pool_hash: Required pool hash. See :py:meth:`_pool_hash`.
 
-        We then sort by:
+        :return: A hashable key to sort clusters by.
+        """
+        cluster_id = cluster['Id']
+
+        log.debug('  Considering joining cluster %s...' % cluster_id)
+
+        # skip if user specified a key pair and it doesn't match
+        if (self._opts['ec2_key_pair'] and
+                self._opts['ec2_key_pair'] !=
+                cluster['Ec2InstanceAttributes'].get('Ec2KeyName')):
+            log.debug('    ec2 key pair mismatch')
+            return
+
+        # only take persistent clusters
+        if cluster['AutoTerminate']:
+            log.debug('    not persistent')
+            return
+
+        # match pool name, and (bootstrap) hash
+        pool_hash, pool_name = _pool_hash_and_name(cluster)
+
+        if req_pool_hash != pool_hash:
+            log.debug('    pool hash mismatch')
+            return
+
+        if self._opts['pool_name'] != pool_name:
+            log.debug('    pool name mismatch')
+            return
+
+        if self._opts['release_label']:
+            # just check for exact match. EMR doesn't have a concept
+            # of partial release labels like it does for AMI versions.
+            release_label = cluster.get('ReleaseLabel')
+
+            if release_label != self._opts['release_label']:
+                log.debug('    release label mismatch')
+                return
+        else:
+            # match actual AMI version
+            image_version = cluster.get('RunningAmiVersion', '')
+            # Support partial matches, e.g. let a request for
+            # '2.4' pass if the version is '2.4.2'. The version
+            # extracted from the existing cluster should always
+            # be a full major.minor.patch, so checking matching
+            # prefixes should be sufficient.
+            if not image_version.startswith(self._opts['image_version']):
+                log.debug('    image version mismatch')
+                return
+
+        if self._opts['image_id'] != cluster.get('CustomAmiId'):
+            log.debug('    custom image ID mismatch')
+            return
+
+        if self._opts['ebs_root_volume_gb']:
+            if 'EbsRootVolumeSize' not in cluster:
+                log.debug('    EBS root volume size not set')
+                return
+            elif (cluster['EbsRootVolumeSize'] <
+                    self._opts['ebs_root_volume_gb']):
+                log.debug('    EBS root volume size too small')
+                return
+        else:
+            if 'EbsRootVolumeSize' in cluster:
+                log.debug('    uses non-default EBS root volume size')
+                return
+
+        applications = self._applications()
+        if applications:
+            # use case-insensitive mapping (see #1417)
+            expected_applications = set(a.lower() for a in applications)
+
+            cluster_applications = set(
+                a['Name'].lower() for a in cluster.get('Applications', []))
+
+            if not expected_applications <= cluster_applications:
+                log.debug('    missing applications: %s' % ', '.join(
+                    sorted(expected_applications - cluster_applications)))
+                return
+
+        emr_configurations = cluster.get('Configurations', [])
+        if self._opts['emr_configurations'] != emr_configurations:
+            log.debug('    emr configurations mismatch')
+            return
+
+        subnet = cluster['Ec2InstanceAttributes'].get('Ec2SubnetId')
+        if isinstance(self._opts['subnet'], list):
+            matches = (subnet in self._opts['subnet'])
+        else:
+            matches = (subnet == self._opts['subnet'])
+
+        if not matches:
+            log.debug('    subnet mismatch')
+            return
+
+        collection_type = cluster.get('InstanceCollectionType',
+                                      'INSTANCE_GROUP')
+
+        instance_sort_key = None
+
+        if self._opts['instance_fleets']:
+            if collection_type != 'INSTANCE_FLEET':
+                log.debug('    does not use instance fleets')
+                return
+
+            actual_fleets = list(_boto3_paginate(
+                'InstanceFleets', emr_client, 'list_instance_fleets',
+                ClusterId=cluster_id))
+
+            req_fleets = self._opts['instance_fleets']
+
+            instance_sort_key = _instance_fleets_satisfy(
+                actual_fleets, req_fleets)
+        else:
+            if collection_type != 'INSTANCE_GROUP':
+                log.debug('    does not use instance groups')
+                return
+
+            # check memory and compute units, bailing out if we hit
+            # an instance with too little memory
+            actual_igs = list(_boto3_paginate(
+                'InstanceGroups', emr_client, 'list_instance_groups',
+                ClusterId=cluster_id))
+
+            requested_igs = self._instance_groups()
+
+            instance_sort_key = _instance_groups_satisfy(
+                actual_igs, requested_igs)
+
+        if not instance_sort_key:
+            return
+
+        log.debug('    OK - valid cluster setup')
+        return instance_sort_key
+
+    def _check_cluster_state(self, emr_client, cluster, num_steps):
+        """Check if the given cluster's state is in a state we can join. This is
+        unlike :py:meth:`~mrjob.emr.EMRJobRunner._compare_cluster_setup` which
+        only checks for preconfigured fields.
+
+        These checks include
+
+        - there is room for our job in the cluster (clusters top out at
+          256 steps)
+        - the cluster does not have a running step
+
+        :param emr_client: a boto3 EMR client. See
+                           :py:meth:`~mrjob.emr.EMRJobRunner.make_emr_client`
+        :param cluster: EMR cluster dict to check if we are able to join.
+        :param num_steps: The number of steps this job requires.
+
+        :return: -1 on failure or num_steps_in_cluster on success
+        """
+        steps = list(_boto3_paginate(
+            'Steps',
+            emr_client, 'list_steps', ClusterId=cluster['Id']))
+
+        if self._opts['release_label']:
+            max_steps = _4_X_MAX_STEPS
+        else:
+            image_version = cluster.get('RunningAmiVersion', '')
+            max_steps = map_version(image_version, _IMAGE_VERSION_TO_MAX_STEPS)
+
+        # don't add more steps than EMR will allow/display through the API
+        if len(steps) + num_steps > max_steps:
+            log.debug('    no room for our steps')
+            return -1
+
+        # in rare cases, cluster can be WAITING *and* have incomplete
+        # steps. We could just check for PENDING steps, but we're
+        # trying to be defensive about EMR adding a new step state.
+        # Not entirely sure what to make of CANCEL_PENDING
+        for step in steps:
+            if (step['Status']['State'] not in (
+                    'CANCELLED', 'INTERRUPTED') and
+                    not step['Status'].get('Timeline', {}).get(
+                        'EndDateTime')):
+                log.debug('    unfinished steps')
+                return -1
+
+        log.debug('    OK - valid cluster state')
+        return len(steps)
+
+    def _usable_clusters(self, exclude=set(), num_steps=1):
+        """Get clusters that this runner can join, returning a list of
+        ``(cluster_id, num_steps)`` (number of steps is used for locking).
+
+        This list is sorted by
         - total compute units for core + task nodes
         - total compute units for master node
         - time left to an even instance hour
 
         The most desirable clusters come *last* in the list.
 
-        :return: tuple of (:py:class:`botoemr.emrobject.Cluster`,
-                           num_steps_in_cluster)
+        :return: tuple of (cluster_id, num_steps_in_cluster)
         """
         emr_client = self.make_emr_client()
-        exclude = exclude or set()
-
-        req_hash = self._pool_hash()
+        req_pool_hash = self._pool_hash()
 
         # list of (sort_key, cluster_id, num_steps)
         key_cluster_steps_list = []
 
-        def add_if_match(cluster):
-            log.debug('  Considering joining cluster %s...' % cluster['Id'])
-
-            # skip if user specified a key pair and it doesn't match
-            if (self._opts['ec2_key_pair'] and
-                    self._opts['ec2_key_pair'] !=
-                    cluster['Ec2InstanceAttributes'].get('Ec2KeyName')):
-                log.debug('    ec2 key pair mismatch')
-                return
-
-            # this may be a retry due to locked clusters
-            if cluster['Id'] in exclude:
-                log.debug('    excluded')
-                return
-
-            # only take persistent clusters
-            if cluster['AutoTerminate']:
-                log.debug('    not persistent')
-                return
-
-            # match pool name, and (bootstrap) hash
-            pool_hash, pool_name = _pool_hash_and_name(cluster)
-
-            if req_hash != pool_hash:
-                log.debug('    pool hash mismatch')
-                return
-
-            if self._opts['pool_name'] != pool_name:
-                log.debug('    pool name mismatch')
-                return
-
-            if self._opts['release_label']:
-                # just check for exact match. EMR doesn't have a concept
-                # of partial release labels like it does for AMI versions.
-                release_label = cluster.get('ReleaseLabel')
-
-                if release_label != self._opts['release_label']:
-                    log.debug('    release label mismatch')
-                    return
-
-                # used below
-                max_steps = _4_X_MAX_STEPS
-            else:
-                # match actual AMI version
-                image_version = cluster.get('RunningAmiVersion', '')
-                # Support partial matches, e.g. let a request for
-                # '2.4' pass if the version is '2.4.2'. The version
-                # extracted from the existing cluster should always
-                # be a full major.minor.patch, so checking matching
-                # prefixes should be sufficient.
-                if not image_version.startswith(self._opts['image_version']):
-                    log.debug('    image version mismatch')
-                    return
-
-                max_steps = map_version(
-                    image_version, _IMAGE_VERSION_TO_MAX_STEPS)
-
-            if self._opts['image_id'] != cluster.get('CustomAmiId'):
-                log.debug('    custom image ID mismatch')
-                return
-
-            if self._opts['ebs_root_volume_gb']:
-                if 'EbsRootVolumeSize' not in cluster:
-                    log.debug('    EBS root volume size not set')
-                    return
-                elif (cluster['EbsRootVolumeSize'] <
-                        self._opts['ebs_root_volume_gb']):
-                    log.debug('    EBS root volume size too small')
-                    return
-            else:
-                if 'EbsRootVolumeSize' in cluster:
-                    log.debug('    uses non-default EBS root volume size')
-                    return
-
-            applications = self._applications()
-            if applications:
-                # use case-insensitive mapping (see #1417)
-                expected_applications = set(a.lower() for a in applications)
-
-                cluster_applications = set(
-                    a['Name'].lower() for a in cluster.get('Applications', []))
-
-                if not expected_applications <= cluster_applications:
-                    log.debug('    missing applications: %s' % ', '.join(
-                        sorted(expected_applications - cluster_applications)))
-                    return
-
-            emr_configurations = cluster.get('Configurations', [])
-            if self._opts['emr_configurations'] != emr_configurations:
-                log.debug('    emr configurations mismatch')
-                return
-
-            subnet = cluster['Ec2InstanceAttributes'].get('Ec2SubnetId')
-            if isinstance(self._opts['subnet'], list):
-                matches = (subnet in self._opts['subnet'])
-            else:
-                matches = (subnet == self._opts['subnet'])
-
-            if not matches:
-                log.debug('    subnet mismatch')
-                return
-
-            steps = list(_boto3_paginate(
-                'Steps',
-                emr_client, 'list_steps', ClusterId=cluster['Id']))
-
-            # don't add more steps than EMR will allow/display through the API
-            if len(steps) + num_steps > max_steps:
-                log.debug('    no room for our steps')
-                return
-
-            # in rare cases, cluster can be WAITING *and* have incomplete
-            # steps. We could just check for PENDING steps, but we're
-            # trying to be defensive about EMR adding a new step state.
-            # Not entirely sure what to make of CANCEL_PENDING
-            for step in steps:
-                if (step['Status']['State'] not in (
-                        'CANCELLED', 'INTERRUPTED') and
-                        not step['Status'].get('Timeline', {}).get(
-                            'EndDateTime')):
-                    log.debug('    unfinished steps')
-                    return
-
-            collection_type = cluster.get('InstanceCollectionType',
-                                          'INSTANCE_GROUP')
-
-            instance_sort_key = None
-
-            if self._opts['instance_fleets']:
-                if collection_type != 'INSTANCE_FLEET':
-                    log.debug('    does not use instance fleets')
-                    return
-
-                actual_fleets = list(_boto3_paginate(
-                    'InstanceFleets', emr_client, 'list_instance_fleets',
-                    ClusterId=cluster['Id']))
-
-                req_fleets = self._opts['instance_fleets']
-
-                instance_sort_key = _instance_fleets_satisfy(
-                    actual_fleets, req_fleets)
-            else:
-                if collection_type != 'INSTANCE_GROUP':
-                    log.debug('    does not use instance groups')
-                    return
-
-                # check memory and compute units, bailing out if we hit
-                # an instance with too little memory
-                actual_igs = list(_boto3_paginate(
-                    'InstanceGroups', emr_client, 'list_instance_groups',
-                    ClusterId=cluster['Id']))
-
-                requested_igs = self._instance_groups()
-
-                instance_sort_key = _instance_groups_satisfy(
-                    actual_igs, requested_igs)
-
-            if not instance_sort_key:
-                return
-
-            log.debug('    OK')
-            key_cluster_steps_list.append(
-                (instance_sort_key, cluster['Id'], len(steps)))
-
         for cluster_summary in _boto3_paginate(
                 'Clusters', emr_client, 'list_clusters',
                 ClusterStates=['WAITING']):
+            cluster_id = cluster_summary['Id']
+
+            # this may be a retry due to locked clusters
+            if cluster_id in exclude:
+                log.debug('    excluded')
+                continue
 
             cluster = emr_client.describe_cluster(
-                ClusterId=cluster_summary['Id'])['Cluster']
+                ClusterId=cluster_id)['Cluster']
 
-            add_if_match(cluster)
+            instance_sort_key = self._compare_cluster_setup(
+                emr_client, cluster, req_pool_hash)
+            if not instance_sort_key:
+                continue
 
-        return [(cluster_id, cluster_num_steps) for
-                (sort_key, cluster_id, cluster_num_steps)
+            num_steps_in_cluster = self._check_cluster_state(
+                emr_client, cluster, num_steps)
+            if num_steps_in_cluster == -1:
+                continue
+
+            key_cluster_steps_list.append(
+                (instance_sort_key, cluster_id, num_steps_in_cluster,))
+
+        return [(_cluster_id, cluster_num_steps) for
+                (_, _cluster_id, cluster_num_steps)
                 in sorted(key_cluster_steps_list)]
 
     def _find_cluster(self, num_steps=1):
