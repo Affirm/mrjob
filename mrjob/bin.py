@@ -844,14 +844,14 @@ class MRJobBinRunner(MRJobRunner):
 
     def _spark_cmdenv(self, step_num):
         """Returns a dictionary mapping environment variable to value,
-        including mapping PYSPARK_PYTHON to self._python_bin()
+        including mapping PYSPARK_PYTHON to self._task_python_bin()
         """
         step = self._get_step(step_num)
 
         cmdenv = {}
 
-        if step['type'] in ('spark', 'spark_script'):  # not spark_jar
-            cmdenv = dict(PYSPARK_PYTHON=cmd_line(self._python_bin()))
+        if step['type'] in ('spark', 'spark_script', 'spark_jar'):
+            cmdenv = dict(PYSPARK_PYTHON=' '.join(self._task_python_bin()))
         cmdenv.update(self._opts['cmdenv'])
         return cmdenv
 
