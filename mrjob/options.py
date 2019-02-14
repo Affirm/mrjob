@@ -723,6 +723,17 @@ _RUNNER_OPTS = dict(
             )),
         ],
     ),
+    yarn_logs_output_base=dict(
+        switches=[
+            (['--yarn-logs-output-base'], dict(
+                help=('Writes failure logs that are too large for stdout to'
+                      ' <this path>/<job key>/log name>. In particular, master'
+                      ' setup failure logs and yarn application logs after an'
+                      ' application failure. Note, these logs will not be'
+                      ' cleaned up by mrjob and must be managed by the user.'),
+            )),
+        ],
+    ),
     gcloud_bin=dict(
         combiner=combine_cmds,
         switches=[

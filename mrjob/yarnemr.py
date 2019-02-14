@@ -15,6 +15,7 @@
 from __future__ import division
 import logging
 import operator
+import os
 import re
 import time
 from datetime import datetime
@@ -93,8 +94,14 @@ class YarnEMRJobRunner(EMRJobRunner):
 
     OPT_NAMES = EMRJobRunner.OPT_NAMES | {
         'expected_cores',
-        'expected_memory'
+        'expected_memory',
+        'yarn_logs_output_base'
     }
+
+    def _required_arg(self, name):
+        if self._opts[name] is None:
+            raise ValueError('The argument "{}" is required for the YARN '
+                             ' EMR runner'.format(name))
 
     def __init__(self, **kwargs):
         """:py:class:`~mrjob.yarnemr.YarnEMRJobRunner` takes the same arguments
@@ -102,20 +109,10 @@ class YarnEMRJobRunner(EMRJobRunner):
         `expected_memory`."""
         super(YarnEMRJobRunner, self).__init__(**kwargs)
 
-        if self._opts['expected_cores'] is None:
-            raise ValueError('The argument "expected_cores" is required for'
-                             ' the YARN EMR runner')
-
-        # arg required for scheduling
-        if self._opts['expected_memory'] is None:
-            raise ValueError('The argument "expected_memory" is required for'
-                             ' the YARN EMR runner')
-
-        # arg required for ssh, no need to validate `ssh_bin` as
-        # there is a default
-        if self._opts['ec2_key_pair_file'] is None:
-            raise ValueError('The argument "ec2_key_pair_file" is required for'
-                             ' the YARN EMR runner')
+        self._required_arg('expected_cores')
+        self._required_arg('expected_memory')
+        self._required_arg('yarn_logs_output_base')
+        self._required_arg('ec2_key_pair_file')
 
         self._ensure_fair_scheduler()
 
@@ -383,11 +380,22 @@ class YarnEMRJobRunner(EMRJobRunner):
                                 ' state {}'.format(cluster_id, state))
             time.sleep(sleep_amount)
 
-    def _run_ssh_on_master(self, cmd_args, desc, stdin=None):
+    def _write_to_log_file(self, filename, text):
+        """Simply write string to the output dir."""
+        file_path = os.path.join(self._opts['yarn_logs_output_base'],
+                                 self._job_key,
+                                 filename)
+        with open(file_path, 'w') as file:
+            file.write(text)
+        return file_path
+
+    def _run_ssh_on_master(self, cmd_args, desc, stdin=None, log_file=None):
         """"Wraps :py:meth:`~mrjob.fs.ssh.SSHFilesystem._ssh_run` with our
         exception logic.
 
-        Also adds ``desc`` param to be used in info and error logging."""
+        The ``desc`` param to be used in info and error logging. If `log_file``
+        is specified log a failure to the file rather than stdout.
+        """
 
         host = self._address_of_master()
         try:
@@ -395,8 +403,13 @@ class YarnEMRJobRunner(EMRJobRunner):
             stdout, stderr = self.fs._ssh_run(host, cmd_args, stdin=stdin)
             return stderr
         except IOError as ex:
-            log.info('A failure occured; printing stderr logs here')
-            log.info(str(ex))
+            if log_file:
+                file_path = self._write_to_log_file(log_file, str(ex))
+                log.info('  A failure occured; logging stderr to {}'
+                         .format(file_path))
+            else:
+                log.info('  A failure occured; printing stderr logs to stdout')
+                log.info(str(ex))
             raise StepFailedException(step_desc=desc.capitalize(),
                                       reason='see above logs')
 
@@ -452,7 +465,7 @@ class YarnEMRJobRunner(EMRJobRunner):
         if self._master_node_setup_mgr.paths() or self._opts['master_setup']:
             mns_stdin = open(self._master_node_setup_script_path)
             self._run_ssh_on_master(['bash -s'], 'master setup',
-                                    stdin=mns_stdin)
+                                    stdin=mns_stdin, log_file='ms.sh')
         else:
             log.debug('No master setup to run')
 
@@ -484,7 +497,12 @@ class YarnEMRJobRunner(EMRJobRunner):
         it handles log aggregation well."""
         log.info('Attempting to aquire YARN application logs')
         log_request = ['sudo', 'yarn', 'logs', '-applicationId', self._appid]
-        self._run_ssh_on_master(log_request, 'YARN log retrieval')
+        try:
+            stderr = self._run_ssh_on_master(log_request, 'YARN log retrieval')
+            file_path = self._write_to_log_file('yapp.log', stderr)
+            log.info('  Wrote YARN application logs to {}'.format(file_path))
+        except StepFailedException:
+            log.info('  Unable to retrieve YARN application logs :(')
 
     def _check_for_job_completion(self):
         log.info('Waiting for {} to complete...'.format(self._appid))
@@ -497,9 +515,12 @@ class YarnEMRJobRunner(EMRJobRunner):
             # If the job is in not in a finished state then log the progress
             # and continue
             if app_info['state'] not in ('FINISHED', 'FAILED', 'KILLED'):
-                elapsed_time = timedelta(milliseconds=app_info['elapsedTime'])
+                # rounds the elapsed time to seconds for better formatting
+                elapsed_ms = timedelta(milliseconds=app_info['elapsedTime'])
+                elapsed_time = timedelta(seconds=elapsed_ms.seconds)
                 progress = app_info['progress']
-                log.info('  RUNNING for {0} with {1:.1%} complete'.format(elapsed_time, progress))
+                log.info('  RUNNING for {0} with {1:.1f}% complete'
+                         .format(elapsed_time, progress))
                 continue
 
             # One of the following: UNDEFINED, SUCCEEDED, FAILED, KILLED
@@ -510,8 +531,7 @@ class YarnEMRJobRunner(EMRJobRunner):
             else:
                 log.info('  {} reached failure state {} :('
                          .format(self._appid, final_status))
-                # TODO: grab these logs and put them logs somewhere
-                # self._get_yarn_logs()
+                self._get_yarn_logs()
                 tracking_url = app_info['trackingUrl']
                 raise StepFailedException(
                         step_desc='Application {}'.format(self._appid),
