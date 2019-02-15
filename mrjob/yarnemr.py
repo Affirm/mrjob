@@ -20,8 +20,10 @@ import re
 import time
 from datetime import datetime
 from datetime import timedelta
+from urllib3.exceptions import HTTPError
 
 from mrjob.aws import _boto3_paginate
+from mrjob.cache import ClusterCache
 from mrjob.compat import version_gte
 from mrjob.emr import _attempt_to_acquire_lock
 from mrjob.emr import _EMR_STATES_STARTING
@@ -36,6 +38,13 @@ from mrjob.yarn_api import YarnResourceManager
 
 
 log = logging.getLogger(__name__)
+
+
+# Since our file cache of cluster info will grow unboundedly as clusters
+# terminate and new clusters start we must cleanup at some point. When the
+# cache is strictly greater than this many days old, we delete the cache
+# and begin again.
+_CLUSTER_FILE_CACHE_TTL_DAYS = 3
 
 # Amount of time in seconds before we timeout yarn api calls.
 _YARN_API_TIMEOUT = 20
@@ -93,6 +102,7 @@ class YarnEMRJobRunner(EMRJobRunner):
     alias = 'yarnemr'
 
     OPT_NAMES = EMRJobRunner.OPT_NAMES | {
+        'cluster_cache_file',
         'expected_cores',
         'expected_memory',
         'yarn_logs_output_base'
@@ -109,10 +119,14 @@ class YarnEMRJobRunner(EMRJobRunner):
         `expected_memory`."""
         super(YarnEMRJobRunner, self).__init__(**kwargs)
 
+        self._required_arg('cluster_cache_file')
         self._required_arg('expected_cores')
         self._required_arg('expected_memory')
         self._required_arg('yarn_logs_output_base')
         self._required_arg('ec2_key_pair_file')
+
+        self._cluster_cache = None
+        ClusterCache.setup(self._opts['cluster_cache_file'])
 
         self._ensure_fair_scheduler()
 
@@ -145,6 +159,15 @@ class YarnEMRJobRunner(EMRJobRunner):
                 'Classification': 'yarn-site',
                 'Properties': {scheduler_key: fair_scheduler}
             })
+
+    @property
+    def cluster_cache(self):
+        if self._cluster_cache is None:
+            self._cluster_cache = ClusterCache(
+                                        self.make_emr_client(),
+                                        self._opts['cluster_cache_file'],
+                                        _CLUSTER_FILE_CACHE_TTL_DAYS)
+        return self._cluster_cache
 
     def _launch(self):
         """Set up files and then launch our job on the EMR cluster."""
@@ -214,7 +237,12 @@ class YarnEMRJobRunner(EMRJobRunner):
         #       allows for this, we will just be lazy.
         host = cluster['MasterPublicDnsName']
         yrm = YarnResourceManager(host, _YARN_API_TIMEOUT)
-        metrics = yrm.get_cluster_metrics()
+        try:
+            metrics = yrm.get_cluster_metrics()
+        except HTTPError:
+            log.info('    received exception while querying cluster metrics')
+            return -1
+
         log.debug('Cluster metrics: {}'.format(metrics))
         if all(constraint(metrics) for constraint in resource_constraints):
             log.debug('    OK - valid cluster state')
@@ -262,8 +290,7 @@ class YarnEMRJobRunner(EMRJobRunner):
             # if we haven't seen this cluster before then check the setup
             cluster = valid_clusters.get(cluster_id, None)
             if cluster is None:
-                cluster = emr_client.describe_cluster(
-                    ClusterId=cluster_id)['Cluster']
+                cluster = self.cluster_cache.describe_cluster(cluster_id)
                 if not self._compare_cluster_setup(
                         emr_client, cluster, req_pool_hash):
                     invalid_clusters.add(cluster_id)
@@ -376,17 +403,16 @@ class YarnEMRJobRunner(EMRJobRunner):
             else:
                 assert state in _EMR_STATES_STARTING, 'Reached invalid state'
             if num_attempts >= max_attempts:
-                raise Exception('Max attempts exceed, cluster {} in'
+                raise Exception('Max attempts exceeded, cluster {} in'
                                 ' state {}'.format(cluster_id, state))
             time.sleep(sleep_amount)
 
     def _write_to_log_file(self, filename, text):
         """Simply write string to the output dir."""
         file_path = os.path.join(self._opts['yarn_logs_output_base'],
-                                 self._job_key,
-                                 filename)
-        with open(file_path, 'w') as file:
-            file.write(text)
+                                 '{}_{}'.format(self._job_key, filename))
+        with open(file_path, 'w') as fp:
+            fp.write(text)
         return file_path
 
     def _run_ssh_on_master(self, cmd_args, desc, stdin=None, log_file=None):
@@ -401,7 +427,7 @@ class YarnEMRJobRunner(EMRJobRunner):
         try:
             log.info('Running {} command over ssh'.format(desc))
             stdout, stderr = self.fs._ssh_run(host, cmd_args, stdin=stdin)
-            return stderr
+            return stdout, stderr
         except IOError as ex:
             if log_file:
                 file_path = self._write_to_log_file(log_file, str(ex))
@@ -474,7 +500,8 @@ class YarnEMRJobRunner(EMRJobRunner):
             raise AssertionError('Multiple steps not yet supported in'
                                  ' yarn runner')
         spark_submit_command = self._build_step(0)
-        stderr = self._run_ssh_on_master(spark_submit_command, 'spark submit')
+        _, stderr = self._run_ssh_on_master(spark_submit_command,
+                                            'spark submit')
 
         # The application ID appears in several places in these logs, but we
         # choose to take it from the log-line where we submit the application
@@ -498,8 +525,9 @@ class YarnEMRJobRunner(EMRJobRunner):
         log.info('Attempting to aquire YARN application logs')
         log_request = ['sudo', 'yarn', 'logs', '-applicationId', self._appid]
         try:
-            stderr = self._run_ssh_on_master(log_request, 'YARN log retrieval')
-            file_path = self._write_to_log_file('yapp.log', stderr)
+            stdout, _ = self._run_ssh_on_master(log_request,
+                                                'YARN log retrieval')
+            file_path = self._write_to_log_file('yapp.log', stdout)
             log.info('  Wrote YARN application logs to {}'.format(file_path))
         except StepFailedException:
             log.info('  Unable to retrieve YARN application logs :(')
@@ -531,7 +559,8 @@ class YarnEMRJobRunner(EMRJobRunner):
             else:
                 log.info('  {} reached failure state {} :('
                          .format(self._appid, final_status))
-                self._get_yarn_logs()
+                # Disable getting yarn logs
+                # self._get_yarn_logs()
                 tracking_url = app_info['trackingUrl']
                 raise StepFailedException(
                         step_desc='Application {}'.format(self._appid),

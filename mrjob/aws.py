@@ -300,7 +300,9 @@ def _boto3_paginate(what, boto3_client, api_call, **api_params):
     # We wrap the pagination object itself so that all the paginator's request
     # method is  retried in the background; otherwise the generator will fail
     # on the first retriable exception.
-    paginator_generator = _wrap_aws_client(paginator.paginate(**api_params))
+    current_backoff = boto3_client._RetryWrapper__backoff
+    paginator_generator = _wrap_aws_client(paginator.paginate(**api_params),
+                                           min_backoff=current_backoff)
 
     for page in paginator_generator:
         if _delay:
