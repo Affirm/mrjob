@@ -37,6 +37,10 @@ class MockPaginator(object):
         self.page_size = page_size
 
     def paginate(self, **kwargs):
+        gen = self._paginate(**kwargs)
+        return MockPaginatorPaginate(gen)
+
+    def _paginate(self, **kwargs):
         result = self.method(**kwargs)
 
         values = result[self.result_key]
@@ -44,3 +48,21 @@ class MockPaginator(object):
         for page_start in range(0, len(values), self.page_size):
             page = values[page_start:page_start + self.page_size]
             yield combine_dicts(result, {self.result_key: page})
+
+
+class MockPaginatorPaginate(object):
+    """
+    Mocks a single pagination class of the pagination generator.
+    This more closely resembles what the boto API returns from paginate()
+    which is an iterable with a _make_request() function.
+    """
+    def __init__(self, gen):
+        self._gen = gen
+
+    def __iter__(self):
+        for item in self._gen:
+            yield item
+        raise StopIteration
+
+    def _make_request(self):
+        pass

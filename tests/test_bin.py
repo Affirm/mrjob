@@ -51,7 +51,6 @@ from tests.sandbox import EmptyMrjobConfTestCase
 from tests.sandbox import SandboxedTestCase
 from tests.sandbox import mrjob_conf_patcher
 
-
 # used to match command lines
 if PY2:
     PYTHON_BIN = 'python'
@@ -619,6 +618,7 @@ class SetupTestCase(SandboxedTestCase):
         job.sandbox()
 
         with job.make_runner() as r:
+            import pdb; pdb.set_trace()
             r.run()
 
             path_to_size = dict(job.parse_output(r.cat_output()))

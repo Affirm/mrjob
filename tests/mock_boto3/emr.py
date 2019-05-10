@@ -127,6 +127,8 @@ class MockEMRClient(object):
         list_steps='Steps',
     )
 
+    _RetryWrapper__backoff = 1
+
     def __init__(self,
                  aws_access_key_id=None,
                  aws_secret_access_key=None,
