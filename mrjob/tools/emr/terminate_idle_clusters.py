@@ -74,7 +74,7 @@ from datetime import timedelta
 
 from mrjob.aws import _boto3_now
 from mrjob.aws import _boto3_paginate
-from mrjob.emr import _attempt_to_acquire_lock
+from mrjob.emr import (_attempt_to_acquire_lock, NEW_CLUSTER_LOCK_STRING)
 from mrjob.emr import EMRJobRunner
 from mrjob.job import MRJob
 from mrjob.options import _add_basic_args
@@ -236,7 +236,7 @@ def _maybe_terminate_clusters(dry_run=False,
             runner=runner,
             cluster_id=cluster_id,
             cluster_name=cluster_summary['Name'],
-            num_steps=len(steps),
+            lock_string=steps[0]['Id'] if steps else NEW_CLUSTER_LOCK_STRING,
             is_pending=is_pending,
             time_idle=time_idle,
             dry_run=dry_run,
@@ -313,7 +313,7 @@ def _time_last_active(cluster_summary, steps):
     return max(timestamps)
 
 
-def _terminate_and_notify(runner, cluster_id, cluster_name, num_steps,
+def _terminate_and_notify(runner, cluster_id, cluster_name, lock_string,
                           is_pending, time_idle,
                           dry_run=False, max_mins_locked=None, quiet=False):
 
@@ -329,7 +329,7 @@ def _terminate_and_notify(runner, cluster_id, cluster_name, num_steps,
     else:
         status = _attempt_to_acquire_lock(
             runner.fs,
-            runner._lock_uri(cluster_id, num_steps),
+            runner._lock_uri(cluster_id, lock_string),
             runner._opts['cloud_fs_sync_secs'],
             '%s (%s)' % (msg,
                          runner._make_unique_job_key(label='terminate')),

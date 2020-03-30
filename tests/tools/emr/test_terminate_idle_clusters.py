@@ -78,6 +78,7 @@ class ClusterTerminationTestCase(MockBoto3TestCase):
                 timeline['EndDateTime'] = ended
 
             return dict(
+                Id='s-DEFAULT_STEP',
                 Config=dict(
                     ActionOnFailure=action_on_failure,
                     Args=args,
