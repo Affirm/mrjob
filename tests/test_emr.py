@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 # Copyright 2009-2016 Yelp and Contributors
-# Copyright 2017 Yelp
-# Copyright 2018 Yelp
+# Copyright 2017-2018 Yelp
+# Copyright 2019 Yelp and Contributors
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -45,9 +45,9 @@ from mrjob.emr import _3_X_SPARK_SUBMIT
 from mrjob.emr import _4_X_COMMAND_RUNNER_JAR
 from mrjob.emr import _BAD_BASH_IMAGE_VERSION
 from mrjob.emr import _DEFAULT_IMAGE_VERSION
-from mrjob.emr import _HUGE_PART_THRESHOLD
 from mrjob.emr import _MAX_MINS_IDLE_BOOTSTRAP_ACTION_PATH
 from mrjob.emr import _PRE_4_X_STREAMING_JAR
+from mrjob.fs.s3 import _HUGE_PART_SIZE
 from mrjob.job import MRJob
 from mrjob.parse import parse_s3_uri
 from mrjob.pool import _extract_tags
@@ -82,16 +82,15 @@ from tests.py2 import call
 from tests.py2 import patch
 from tests.sandbox import SandboxedTestCase
 from tests.sandbox import mrjob_conf_patcher
+from tests.test_bin import PYTHON_BIN
 from tests.test_hadoop import HadoopExtraArgsTestCase
 from tests.test_inline import InlineInputManifestTestCase
-from tests.test_local import _bash_wrap
 
-# used to match command lines
-if PY2:
-    PYTHON_BIN = 'python'
-    # prior to AMI 4.3.0, we use python2.7
+
+if PYTHON_BIN == 'python':
+    OLD_AMI_PYTHON_BIN = 'python2.7'
 else:
-    PYTHON_BIN = 'python3'
+    OLD_AMI_PYTHON_BIN = PYTHON_BIN
 
 # EMR configurations used for testing
 # from http://docs.aws.amazon.com/ElasticMapReduce/latest/ReleaseGuide/emr-configure-apps.html  # noqa
@@ -321,10 +320,10 @@ class EMRJobRunnerEndToEndTestCase(MockBoto3TestCase):
 
             list(runner.cat_output())
 
-        bucket = runner.fs.get_bucket(tmp_bucket)
+        bucket = runner.fs.s3.get_bucket(tmp_bucket)
         self.assertEqual(len(list(bucket.objects.all())), tmp_len)
 
-        bucket = runner.fs.get_bucket(log_bucket)
+        bucket = runner.fs.s3.get_bucket(log_bucket)
         self.assertEqual(len(list(bucket.objects.all())), log_len)
 
     def test_cleanup_all(self):
@@ -466,25 +465,16 @@ class VisibleToAllUsersTestCase(MockBoto3TestCase):
         cluster = self.run_and_get_cluster()
         self.assertEqual(cluster['VisibleToAllUsers'], True)
 
-    def test_no_visible(self):
-        cluster = self.run_and_get_cluster('--no-visible-to-all-users')
+    def test_overridden_false(self):
+        cluster = self.run_and_get_cluster(
+                            '--extra-cluster-param', 'VisibleToAllUsers=false')
         self.assertEqual(cluster['VisibleToAllUsers'], False)
 
-    def test_visible(self):
-        cluster = self.run_and_get_cluster('--visible-to-all-users')
+    def test_overridden_true(self):
+        cluster = self.run_and_get_cluster(
+                            '--extra-cluster-param', 'VisibleToAllUsers=true')
         self.assertEqual(cluster['VisibleToAllUsers'], True)
 
-    def test_force_to_bool(self):
-        VISIBLE_MRJOB_CONF = {'runners': {'emr': {
-            'emr_backoff': 0.01,  # must be non-zero
-            'check_cluster_every': 0.00,
-            'cloud_fs_sync_secs': 0.00,
-            'visible_to_all_users': 1,  # should be True
-        }}}
-
-        with mrjob_conf_patcher(VISIBLE_MRJOB_CONF):
-            cluster = self.run_and_get_cluster()
-            self.assertEqual(cluster['VisibleToAllUsers'], True)
 
     def test_mock_boto3_does_not_force_to_bool(self):
         # make sure that mrjob is converting to bool, not mock_boto3
@@ -506,6 +496,15 @@ class SubnetTestCase(MockBoto3TestCase):
                          'subnet-ffffffff')
 
     def test_empty_string_means_no_subnet(self):
+        cluster = self.run_and_get_cluster('--subnet', '')
+        self.assertEqual(cluster['Ec2InstanceAttributes'].get('Ec2SubnetId'),
+                         None)
+
+    def test_blank_out_subnet_in_mrjob_conf(self):
+        # regression test for #1931
+        self.start(mrjob_conf_patcher(dict(runners=dict(emr=dict(
+            subnet='subnet-ffffffff')))))
+
         cluster = self.run_and_get_cluster('--subnet', '')
         self.assertEqual(cluster['Ec2InstanceAttributes'].get('Ec2SubnetId'),
                          None)
@@ -664,27 +663,52 @@ class ExtraClusterParamsTestCase(MockBoto3TestCase):
         self.assertEqual(cluster['AutoScalingRole'], 'HankPym')
         self.assertEqual(cluster['Name'], 'Dave')
 
+    def test_set_nested_param(self):
+        cluster = self.run_and_get_cluster(
+            '--zone', 'us-west-1a',
+            '--subnet', 'subnet-ffffffff',
+            '--extra-cluster-param',
+            'Instances.Placement.AvailabilityZone=danger-2a')
 
-class DeprecatedEMRAPIParamsTestCase(MockBoto3TestCase):
+        self.assertEqual(
+            cluster['Ec2InstanceAttributes']['Ec2AvailabilityZone'],
+            'danger-2a')
 
-    # emr_api_param is completely disabled
+        # shoudn't blow away subnet, also set in Instances
+        self.assertEqual(
+            cluster['Ec2InstanceAttributes']['Ec2SubnetId'],
+            'subnet-ffffffff')
 
-    def setUp(self):
-        super(DeprecatedEMRAPIParamsTestCase, self).setUp()
+    def test_unset_nested_param(self):
+        cluster = self.run_and_get_cluster(
+            '--zone', 'us-west-1a',
+            '--subnet', 'subnet-ffffffff',
+            '--extra-cluster-param',
+            'Instances.Placement=null')
 
-        self.log = self.start(patch('mrjob.emr.log'))
+        self.assertIsNone(
+            cluster['Ec2InstanceAttributes'].get('Ec2AvailabilityZone'))
 
-    def test_param_set(self):
-        cluster = self.run_and_get_cluster('--emr-api-param', 'name=Dave')
+        # shoudn't blow away subnet, also set in Instances
+        self.assertEqual(
+            cluster['Ec2InstanceAttributes']['Ec2SubnetId'],
+            'subnet-ffffffff')
 
-        self.assertTrue(self.log.warning.called)
-        self.assertNotEqual(cluster['Name'], 'Dave')
+    def test_set_nested_param_with_dict(self):
+        cluster = self.run_and_get_cluster(
+            '--zone', 'us-west-1a',
+            '--subnet', 'subnet-ffffffff',
+            '--extra-cluster-param',
+            'Instances={"Placement": {"AvailabilityZone": "danger-2a"}}')
 
-    def test_param_unset(self):
-        cluster = self.run_and_get_cluster('--no-emr-api-param', 'log_uri')
+        self.assertEqual(
+            cluster['Ec2InstanceAttributes']['Ec2AvailabilityZone'],
+            'danger-2a')
 
-        self.assertTrue(self.log.warning.called)
-        self.assertIn('LogUri', cluster)
+        # shoudn't blow away subnet, also set in Instances
+        self.assertEqual(
+            cluster['Ec2InstanceAttributes']['Ec2SubnetId'],
+            'subnet-ffffffff')
 
 
 class AMIAndHadoopVersionTestCase(MockBoto3TestCase):
@@ -841,7 +865,7 @@ class TmpBucketTestCase(MockBoto3TestCase):
         existing_bucket_names = set(self.mock_s3_fs)
 
         runner = EMRJobRunner(conf_paths=[], **runner_kwargs)
-        runner._create_s3_tmp_bucket_if_needed()
+        runner._upload_local_files()
 
         bucket_name, path = parse_s3_uri(runner._opts['cloud_tmp_dir'])
 
@@ -977,7 +1001,7 @@ class InstanceGroupAndFleetTestCase(MockBoto3TestCase):
     def test_defaults(self):
         self._test_instance_groups(
             {},
-            master=(1, 'm4.large', None))
+            master=(1, 'm5.xlarge', None))
 
     def test_instance_type_single_instance(self):
         self._test_instance_groups(
@@ -988,7 +1012,7 @@ class InstanceGroupAndFleetTestCase(MockBoto3TestCase):
         self._test_instance_groups(
             {'instance_type': 'c1.xlarge', 'num_core_instances': 2},
             core=(2, 'c1.xlarge', None),
-            master=(1, 'm4.large', None))
+            master=(1, 'm5.xlarge', None))
 
     def test_explicit_master_and_core_instance_types(self):
         self._test_instance_groups(
@@ -999,7 +1023,7 @@ class InstanceGroupAndFleetTestCase(MockBoto3TestCase):
             {'core_instance_type': 'm2.xlarge',
              'num_core_instances': 2},
             core=(2, 'm2.xlarge', None),
-            master=(1, 'm4.large', None))
+            master=(1, 'm5.xlarge', None))
 
         self._test_instance_groups(
             {'master_instance_type': 'm1.large',
@@ -1076,7 +1100,7 @@ class InstanceGroupAndFleetTestCase(MockBoto3TestCase):
         self._test_instance_groups(
             {},
             core=(2, 'c1.xlarge', None),
-            master=(1, 'm4.large', None))
+            master=(1, 'm5.xlarge', None))
 
         self._test_instance_groups(
             {'master_instance_type': 'm1.large',
@@ -1193,23 +1217,23 @@ class InstanceGroupAndFleetTestCase(MockBoto3TestCase):
         self._test_instance_groups(
             {'master_instance_bid_price': '0',
              },
-            master=(1, 'm4.large', None))
+            master=(1, 'm5.xlarge', None))
 
         self._test_instance_groups(
             {'num_core_instances': 3,
              'core_instance_bid_price': '0.00',
              },
-            core=(3, 'm4.large', None),
-            master=(1, 'm4.large', None))
+            core=(3, 'm5.xlarge', None),
+            master=(1, 'm5.xlarge', None))
 
         self._test_instance_groups(
             {'num_core_instances': 3,
              'num_task_instances': 5,
              'task_instance_bid_price': '',
              },
-            core=(3, 'm4.large', None),
-            master=(1, 'm4.large', None),
-            task=(5, 'm4.large', None))
+            core=(3, 'm5.xlarge', None),
+            master=(1, 'm5.xlarge', None),
+            task=(5, 'm5.xlarge', None))
 
     def test_pass_invalid_bid_prices_through_to_emr(self):
         self.assertRaises(
@@ -1224,7 +1248,7 @@ class InstanceGroupAndFleetTestCase(MockBoto3TestCase):
              'num_task_instances': 20,
              },
             core=(5, 'c1.medium', None),
-            master=(1, 'm4.large', None),
+            master=(1, 'm5.xlarge', None),
             task=(20, 'c1.medium', None))
 
     def test_explicit_instance_groups(self):
@@ -1258,7 +1282,7 @@ class InstanceGroupAndFleetTestCase(MockBoto3TestCase):
             dict(
                 instance_fleets=[dict(
                     InstanceFleetType='MASTER',
-                    InstanceTypeConfigs=[dict(InstanceType='m4.large')],
+                    InstanceTypeConfigs=[dict(InstanceType='m5.xlarge')],
                     TargetOnDemandCapacity=1)]
             )
         )
@@ -1268,7 +1292,7 @@ class InstanceGroupAndFleetTestCase(MockBoto3TestCase):
             dict(
                 instance_fleets=[dict(
                     InstanceFleetType='MASTER',
-                    InstanceTypeConfigs=[dict(InstanceType='m4.large')],
+                    InstanceTypeConfigs=[dict(InstanceType='m5.xlarge')],
                     TargetOnDemandCapacity=1)],
                 instance_groups=[dict(
                     InstanceRole='MASTER',
@@ -1284,15 +1308,15 @@ class InstanceGroupAndFleetTestCase(MockBoto3TestCase):
         self.set_in_mrjob_conf(
             instance_fleets=[dict(
                 InstanceFleetType='MASTER',
-                InstanceTypeConfigs=[dict(InstanceType='m4.large')],
+                InstanceTypeConfigs=[dict(InstanceType='m5.xlarge')],
                 TargetOnDemandCapacity=1)])
 
         self._test_uses_instance_fleets({})
 
         self._test_instance_groups(
             dict(num_core_instances=3),
-            master=(1, 'm4.large', None),
-            core=(3, 'm4.large', None)
+            master=(1, 'm5.xlarge', None),
+            core=(3, 'm5.xlarge', None)
         )
 
     def test_command_line_beats_instance_fleets_in_config_file(self):
@@ -1309,8 +1333,8 @@ class InstanceGroupAndFleetTestCase(MockBoto3TestCase):
 
         self._test_instance_groups(
             dict(num_core_instances=3),
-            master=(1, 'm4.large', None),
-            core=(3, 'm4.large', None)
+            master=(1, 'm5.xlarge', None),
+            core=(3, 'm5.xlarge', None)
         )
 
 
@@ -1594,13 +1618,13 @@ class MasterBootstrapScriptTestCase(MockBoto3TestCase):
 
     def test_create_master_bootstrap_script_on_3_11_0_ami(self):
         self._test_create_master_bootstrap_script(
-            expected_python_bin=('python2.7' if PY2 else PYTHON_BIN),
+            expected_python_bin=(OLD_AMI_PYTHON_BIN),
             image_version='3.11.0')
 
     def test_create_master_bootstrap_script_on_2_4_11_ami(self):
         self._test_create_master_bootstrap_script(
             image_version='2.4.11',
-            expected_python_bin=('python2.7' if PY2 else PYTHON_BIN))
+            expected_python_bin=(OLD_AMI_PYTHON_BIN))
 
     def test_no_bootstrap_script_if_not_needed(self):
         runner = EMRJobRunner(conf_paths=[], bootstrap_mrjob=False,
@@ -1881,9 +1905,9 @@ class MasterNodeSetupScriptTestCase(MockBoto3TestCase):
         with open(runner._master_node_setup_script_path, 'rb') as f:
             contents = f.read()
 
-        self.assertIn('  COW=MOO\n', contents)
-        self.assertIn('  CAT=MEOW\n', contents)
-        self.assertIn('  echo "$COW"\n  echo "$CAT"\n', contents)
+        self.assertIn(b'  COW=MOO\n', contents)
+        self.assertIn(b'  CAT=MEOW\n', contents)
+        self.assertIn(b'  echo "$COW"\n  echo "$CAT"\n', contents)
 
     def test_master_setup_upload(self):
         runner = EMRJobRunner(upload_files='moo.txt',
@@ -1987,22 +2011,6 @@ class MaxMinsIdleTestCase(MockBoto3TestCase):
             runner.make_persistent_cluster()
             self.assertRanIdleTimeoutScriptWith(runner, ['900'])
 
-    def test_deprecated_max_hours_idle(self):
-        mr_job = MRWordCount(['-r', 'emr', '--max-mins-idle', '16.5'])
-        mr_job.sandbox()
-
-        with mr_job.make_runner() as runner:
-            runner.make_persistent_cluster()
-            self.assertRanIdleTimeoutScriptWith(runner, ['990'])
-
-    def test_deprecated_mins_to_end_of_hour_does_nothing(self):
-        mr_job = MRWordCount(['-r', 'emr', '--mins-to-end-of-hour', '10'])
-        mr_job.sandbox()
-
-        with mr_job.make_runner() as runner:
-            runner.make_persistent_cluster()
-            self.assertRanIdleTimeoutScriptWith(runner, ['600'])
-
     def test_use_integer(self):
         mr_job = MRWordCount(['-r', 'emr', '--max-mins-idle', '60.00006'])
         mr_job.sandbox()
@@ -2013,14 +2021,6 @@ class MaxMinsIdleTestCase(MockBoto3TestCase):
 
     def test_bootstrap_script_is_actually_installed(self):
         self.assertTrue(os.path.exists(_MAX_MINS_IDLE_BOOTSTRAP_ACTION_PATH))
-
-    def test_deprecated_max_hours_idle_works(self):
-        mr_job = MRWordCount(['-r', 'emr', '--max-hours-idle', '1'])
-        mr_job.sandbox()
-
-        with mr_job.make_runner() as runner:
-            runner.make_persistent_cluster()
-            self.assertRanIdleTimeoutScriptWith(runner, ['3600'])
 
 
 class TestCatFallback(MockBoto3TestCase):
@@ -2285,7 +2285,8 @@ class BuildStreamingStepTestCase(MockBoto3TestCase):
         self.assertEqual(
             step['HadoopJarStep']['Args'], [
                 '-files',
-                '%s#my_job.py' % runner._upload_mgr.uri('my_job.py'),
+                '%s#my_job.py' % (
+                    runner._dest_in_wd_mirror('my_job.py', 'my_job.py')),
                 '-D', 'mapreduce.job.reduces=0',
                 '-input', 'input', '-output', 'output',
                 '-mapper',
@@ -2301,7 +2302,8 @@ class BuildStreamingStepTestCase(MockBoto3TestCase):
         self.assertEqual(
             step['HadoopJarStep']['Args'], [
                 '-files',
-                '%s#my_job.py' % runner._upload_mgr.uri('my_job.py'),
+                '%s#my_job.py' % (
+                    runner._dest_in_wd_mirror('my_job.py', 'my_job.py')),
                 '-input', 'input', '-output', 'output',
                 '-mapper', 'cat',
                 '-reducer',
@@ -2326,7 +2328,8 @@ class BuildStreamingStepTestCase(MockBoto3TestCase):
         self.assertEqual(
             step['HadoopJarStep']['Args'], [
                 '-files',
-                '%s#my_job.py' % runner._upload_mgr.uri('my_job.py'),
+                '%s#my_job.py' % (
+                    runner._dest_in_wd_mirror('my_job.py', 'my_job.py')),
                 '-input', 'input', '-output', 'output',
                 '-mapper',
                 "/bin/sh -x -c 'set -e; grep anything | %s"
@@ -2344,14 +2347,15 @@ class BuildStreamingStepTestCase(MockBoto3TestCase):
             [dict(type='streaming',
                   mapper=dict(
                       type='script',
-                      pre_filter=_bash_wrap("grep 'anything'")))])
+                      pre_filter="bash -c 'grep '\\''anything'\\'''"))])
 
         step = runner._build_step(0)
 
         self.assertEqual(
             step['HadoopJarStep']['Args'], [
                 '-files',
-                '%s#my_job.py' % runner._upload_mgr.uri('my_job.py'),
+                '%s#my_job.py' % (
+                    runner._dest_in_wd_mirror('my_job.py', 'my_job.py')),
                 '-D', 'mapreduce.job.reduces=0',
                 '-input', 'input', '-output', 'output',
                 '-mapper',
@@ -2379,7 +2383,8 @@ class BuildStreamingStepTestCase(MockBoto3TestCase):
             step['HadoopJarStep']['Args'], [
                 'streaming', '-v',
                 '-files',
-                '%s#my_job.py' % runner._upload_mgr.uri('my_job.py'),
+                '%s#my_job.py' % (
+                    runner._dest_in_wd_mirror('my_job.py', 'my_job.py')),
                 '-D', 'mapreduce.job.reduces=0',
                 '-input', 'input', '-output', 'output',
                 '-mapper',
@@ -2400,7 +2405,8 @@ class BuildStreamingStepTestCase(MockBoto3TestCase):
         self.assertEqual(
             step['HadoopJarStep']['Args'], [
                 '-files',
-                '%s#my_job.py' % runner._upload_mgr.uri('my_job.py'),
+                '%s#my_job.py' % (
+                    runner._dest_in_wd_mirror('my_job.py', 'my_job.py')),
                 '-D', 'mapreduce.job.reduces=0',
                 '-libjars', '/home/hadoop/dora.jar',
                 '-D', 'foo=bar',
@@ -2448,20 +2454,15 @@ class DefaultPythonBinTestCase(MockBoto3TestCase):
 
     def test_4_x_release_label(self):
         runner = EMRJobRunner(release_label='emr-4.0.0')
-        self.assertEqual(runner._default_python_bin(),
-                         ['python2.7'] if PY2 else [PYTHON_BIN])
+        self.assertEqual(runner._default_python_bin(), [OLD_AMI_PYTHON_BIN])
 
     def test_3_11_0_ami(self):
         runner = EMRJobRunner(image_version='3.11.0')
-        self.assertEqual(runner._default_python_bin(),
-                         ['python2.7'] if PY2 else [PYTHON_BIN])
+        self.assertEqual(runner._default_python_bin(), [OLD_AMI_PYTHON_BIN])
 
     def test_2_4_3_ami(self):
         runner = EMRJobRunner(image_version='2.4.3')
-        if PY2:
-            self.assertEqual(runner._default_python_bin(), ['python2.7'])
-        else:
-            self.assertEqual(runner._default_python_bin(), ['python3'])
+        self.assertEqual(runner._default_python_bin(), [OLD_AMI_PYTHON_BIN])
 
     def test_local_python_bin(self):
         # just make sure we don't break this
@@ -2556,7 +2557,7 @@ class JarStepTestCase(MockBoto3TestCase):
             pass
 
         job = MRJarWithGenericArgs(
-            ['-r', 'emr', '--jar', fake_jar, '--libjar', fake_libjar])
+            ['-r', 'emr', '--jar', fake_jar, '--libjars', fake_libjar])
         job.sandbox()
 
         with job.make_runner() as runner:
@@ -2729,7 +2730,9 @@ class SparkStepTestCase(MockBoto3TestCase):
         with job.make_runner() as runner:
             runner.run()
 
-            script_uri = runner._upload_mgr.uri(runner._script_path)
+            script_uri = runner._dest_in_wd_mirror(
+                runner._script_path,
+                runner._working_dir_mgr.name('file', runner._script_path))
             input1_uri = runner._upload_mgr.uri(input1)
             input2_uri = runner._upload_mgr.uri(input2)
 
@@ -2956,14 +2959,6 @@ class MultiPartUploadTestCase(MockBoto3TestCase):
             side_effect=tests.mock_boto3.s3.MockS3Object.upload_file,
             autospec=True))
 
-    def upload_data(self, runner, data):
-        """Upload some bytes to S3"""
-        data_path = os.path.join(self.tmp_dir, self.TEST_FILENAME)
-        with open(data_path, 'wb') as fp:
-            fp.write(data)
-
-        runner._upload_contents(self.TEST_S3_URI, data_path)
-
     def assert_upload_succeeds(self, runner, data, expected_part_size):
         """Write the data to a temp file, and then upload it to (mock) S3,
         checking that the data successfully uploaded."""
@@ -2973,9 +2968,9 @@ class MultiPartUploadTestCase(MockBoto3TestCase):
         with open(data_path, 'wb') as fp:
             fp.write(data)
 
-        runner._upload_contents(self.TEST_S3_URI, data_path)
+        runner.fs.put(data_path, self.TEST_S3_URI)
 
-        s3_key = runner.fs._get_s3_key(self.TEST_S3_URI)
+        s3_key = runner.fs.s3._get_s3_key(self.TEST_S3_URI)
         self.assertEqual(s3_key.get()['Body'].read(), data)
 
         self.assertTrue(self.upload_file.called)
@@ -3007,7 +3002,7 @@ class MultiPartUploadTestCase(MockBoto3TestCase):
         runner = EMRJobRunner(cloud_part_size_mb=0)
 
         data = b'Mew' * 20
-        self.assert_upload_succeeds(runner, data, _HUGE_PART_THRESHOLD)
+        self.assert_upload_succeeds(runner, data, _HUGE_PART_SIZE)
 
 
 class AWSSessionTokenTestCase(MockBoto3TestCase):
@@ -3036,7 +3031,7 @@ class AWSSessionTokenTestCase(MockBoto3TestCase):
         self.assertEqual(iam_kwargs['aws_session_token'], session_token)
 
         self.mock_client.reset_mock()
-        runner.fs.make_s3_client()
+        runner.fs.s3.make_s3_client()
 
         self.assertTrue(self.mock_client.called)
         s3_client_args, s3_client_kwargs = self.mock_client.call_args
@@ -3044,7 +3039,7 @@ class AWSSessionTokenTestCase(MockBoto3TestCase):
         self.assertIn('aws_session_token', s3_client_kwargs)
         self.assertEqual(s3_client_kwargs['aws_session_token'], session_token)
 
-        runner.fs.make_s3_resource()
+        runner.fs.s3.make_s3_resource()
         self.assertTrue(self.mock_client.called)
         s3_resource_args, s3_resource_kwargs = self.mock_client.call_args
         self.assertEqual(s3_resource_args, ('s3',))
@@ -3980,6 +3975,9 @@ class GetStepLogInterpretationTestCase(MockBoto3TestCase):
         self._ls_step_stderr_logs = self.start(patch(
             'mrjob.emr.EMRJobRunner._ls_step_stderr_logs'))
 
+        self._interpret_spark_logs = self.start(patch(
+            'mrjob.emr._interpret_spark_logs'))
+
     def test_basic(self):
         runner = EMRJobRunner()
 
@@ -4068,13 +4066,20 @@ class GetStepLogInterpretationTestCase(MockBoto3TestCase):
         self.assertEqual(
             runner._get_step_log_interpretation(
                 log_interpretation, 'spark'),
-            self._interpret_emr_step_syslog.return_value)
+            self._interpret_spark_logs.return_value)
+
+        # shouldn't use partial=True with step logs, there's usually only one
+        # anyhow (this isn't even an option for Hadoop step logs, but for
+        # spark logs it's the same method as for task logs)
+        self._interpret_spark_logs.assert_called_once_with(
+            runner.fs, self._ls_step_stderr_logs.return_value, partial=False)
 
         self.assertFalse(self.log.warning.called)
         self.assertFalse(self._ls_step_syslogs.called)
         self._ls_step_stderr_logs.assert_called_once_with(step_id='s-STEPID')
-        self._interpret_emr_step_syslog.assert_called_once_with(
+        self._interpret_spark_logs(
             runner.fs, self._ls_step_stderr_logs.return_value)
+        self.assertFalse(self._interpret_emr_step_syslog.called)
         self.assertFalse(self._interpret_emr_step_stderr.called)
 
 
@@ -4190,6 +4195,9 @@ class EMRApplicationsTestCase(MockBoto3TestCase):
 
 class EMRConfigurationsTestCase(MockBoto3TestCase):
 
+    # don't patch load_opts_from_mrjob_confs()
+    MRJOB_CONF_CONTENTS = None
+
     # example from:
     # http://docs.aws.amazon.com/ElasticMapReduce/latest/ReleaseGuide/emr-configure-apps.html  # noqa
 
@@ -4282,6 +4290,79 @@ class EMRConfigurationsTestCase(MockBoto3TestCase):
             self.assertEqual(runner._opts['emr_configurations'],
                              [CORE_SITE_EMR_CONFIGURATION,
                               HADOOP_ENV_EMR_CONFIGURATION])
+
+    def test_clear_tag(self):
+        # regression test for !clear tag crash #2097
+
+        mrjob_1_conf = self.makefile('mrjob.1.conf', contents="""\
+            runners:
+              emr:
+                emr_configurations:
+                - Classification: spark-defaults
+                  Properties:
+                    spark.executor.memory: 28G
+                - Classification: hive-site
+                  Properties:
+                    hive.metastore.client.factory.class: Bees
+                - Classification: core-site
+                  Properties:
+                    hadoop.security.groups.cache.secs: 250""")
+
+        mrjob_2_conf = self.makefile('mrjob.2.conf', contents="""\
+            runners:
+              emr:
+                emr_configurations: !clear
+                - Classification: spark-defaults
+                  Properties:
+                    spark.executor.memory: 2G""")
+
+        job = MRTwoStepJob(
+            ['-r', 'emr', '-c', mrjob_1_conf, '-c', mrjob_2_conf])
+        job.sandbox()
+
+        with job.make_runner() as runner:
+            self.assertEqual(
+                runner._opts['emr_configurations'],
+                [dict(Classification='spark-defaults',
+                      Properties={'spark.executor.memory': '2G'})])
+
+    def test_overwrite_previous_configurations(self):
+        # regression test for suggested fix to #2097
+
+        mrjob_1_conf = self.makefile('mrjob.1.conf', contents="""\
+            runners:
+              emr:
+                emr_configurations:
+                - Classification: spark-defaults
+                  Properties:
+                    spark.executor.memory: 28G
+                - Classification: hive-site
+                  Properties:
+                    hive.metastore.client.factory.class: Bees
+                - Classification: core-site
+                  Properties:
+                    hadoop.security.groups.cache.secs: 25""")
+
+        mrjob_2_conf = self.makefile('mrjob.2.conf', contents="""\
+            runners:
+              emr:
+                emr_configurations:
+                - Classification: spark-defaults
+                  Properties:
+                    spark.executor.memory: 2G
+                - Classification: hive-site""")
+
+        job = MRTwoStepJob(
+            ['-r', 'emr', '-c', mrjob_1_conf, '-c', mrjob_2_conf])
+        job.sandbox()
+
+        with job.make_runner() as runner:
+            self.assertEqual(
+                runner._opts['emr_configurations'],
+                [dict(Classification='spark-defaults',
+                      Properties={'spark.executor.memory': '2G'}),
+                 dict(Classification='core-site',
+                      Properties={'hadoop.security.groups.cache.secs': '25'})])
 
 
 class GetJobStepsTestCase(MockBoto3TestCase):
@@ -4511,6 +4592,7 @@ class WaitForStepsToCompleteTestCase(MockBoto3TestCase):
             'tests.mock_boto3.emr.MockEMRClient.describe_cluster',
             return_value=dict(
                 Cluster=dict(
+                    Applications=[],
                     Id='j-CLUSTERID',
                     Status=dict(
                         State='TERMINATING',
@@ -4674,12 +4756,12 @@ class UseSudoOverSshTestCase(MockBoto3TestCase):
              '--image-version', '4.3.0']).sandbox()
 
         with job.make_runner() as runner:
-            self.assertIsNotNone(runner._ssh_fs)
-            self.assertFalse(runner._ssh_fs._sudo)
+            self.assertTrue(hasattr(runner.fs, 'ssh'))
+            self.assertFalse(runner.fs.ssh._sudo)
 
             self.launch(runner)
 
-            self.assertTrue(runner._ssh_fs._sudo)
+            self.assertTrue(runner.fs.ssh._sudo)
 
     def test_ami_4_2_0_with_ssh_fs(self):
 
@@ -4688,12 +4770,12 @@ class UseSudoOverSshTestCase(MockBoto3TestCase):
              '--image-version', '4.2.0']).sandbox()
 
         with job.make_runner() as runner:
-            self.assertIsNotNone(runner._ssh_fs)
-            self.assertFalse(runner._ssh_fs._sudo)
+            self.assertTrue(hasattr(runner.fs, 'ssh'))
+            self.assertFalse(runner.fs.ssh._sudo)
 
             self.launch(runner)
 
-            self.assertFalse(runner._ssh_fs._sudo)
+            self.assertFalse(runner.fs.ssh._sudo)
 
     def test_ami_4_3_0_without_ssh_fs(self):
         # just make sure we don't cause an error trying to set up sudo
@@ -4702,11 +4784,11 @@ class UseSudoOverSshTestCase(MockBoto3TestCase):
             ['-r', 'emr', '--image-version', '4.3.0']).sandbox()
 
         with job.make_runner() as runner:
-            self.assertIsNone(runner._ssh_fs)
+            self.assertFalse(hasattr(runner.fs, 'ssh'))
 
             self.launch(runner)
 
-            self.assertIsNone(runner._ssh_fs)
+            self.assertFalse(hasattr(runner.fs, 'ssh'))
 
 
 class MasterPrivateIPTestCase(MockBoto3TestCase):
@@ -5016,27 +5098,6 @@ class UsesSparkTestCase(MockBoto3TestCase):
             self.assertTrue(runner._uses_spark())
             self.assertTrue(runner._opts['bootstrap_spark'])
 
-    def test_ignores_new_supported_products_api_param(self):
-        job = MRTwoStepJob(['-r', 'emr',
-                            '--emr-api-param',
-                            'NewSupportedProducts.member.1.Name=spark'])
-        job.sandbox()
-
-        with job.make_runner() as runner:
-            self.assertFalse(runner._uses_spark())
-            self.assertFalse(runner._has_spark_application())
-
-    def test_ignores_application_api_param(self):
-        job = MRTwoStepJob(['-r', 'emr',
-                            '--image-version', '4.0.0',
-                            '--emr-api-param',
-                            'Application.member.1.Name=Spark'])
-        job.sandbox()
-
-        with job.make_runner() as runner:
-            self.assertFalse(runner._uses_spark())
-            self.assertFalse(runner._has_spark_application())
-
 
 class SparkPyFilesTestCase(MockBoto3TestCase):
 
@@ -5336,9 +5397,9 @@ class SparkMasterAndDeployModeTestCase(MockBoto3TestCase):
             self.start(patch('mrjob.emr.EMRJobRunner.get_hadoop_version',
                              return_value='2'))
 
-            self.assertEqual(
-                runner._spark_submit_args(0)[:4],
-                ['--master', 'yarn', '--deploy-mode', 'cluster']
+            self.assertIn(
+                cmd_line(['--master', 'yarn', '--deploy-mode', 'cluster']),
+                cmd_line(runner._spark_submit_args(0))
             )
 
     def test_spark_master_and_deploy_mode_are_hard_coded(self):
@@ -5382,7 +5443,7 @@ class BadBashWorkaroundTestCase(MockBoto3TestCase):
         cookie_jar = self.makefile('cookie.jar')
 
         job = MRTwoStepJob(['-r', 'emr', '--image-version', image_version,
-                            '--libjar', cookie_jar])
+                            '--libjars', cookie_jar])
         job.sandbox()
 
         def check_script(path):
@@ -5618,10 +5679,15 @@ class ProgressHtmlOverSshTestCase(MockBoto3TestCase):
 
         self.assertFalse(self._ssh_run.called)
 
-    def test_no_ssh_bin(self):
-        self.assertIsNone(self._launch_and_get_progress_html('--ssh-bin', ''))
+    def test_empty_ssh_bin_means_default(self):
+        html = self._launch_and_get_progress_html('--ssh-bin', '')
 
-        self.assertFalse(self._ssh_run.called)
+        self.assertIsNotNone(html)
+        self._ssh_run.assert_called_once_with(
+            self.MOCK_MASTER,
+            ['curl', self.MOCK_JOB_TRACKER_URL])
+
+        self.assertEqual(html, self._ssh_run.return_value[0])
 
     def test_no_key_pair_file(self):
         self.assertIsNone(self._launch_and_get_progress_html(
@@ -5854,3 +5920,62 @@ class EMRClientBackoffTest(MockBoto3TestCase):
 
     def test_large_emr_backoff(self):
         self._test_backoff(1000, emr_backoff=1000)
+
+    def test_small_check_cluster_every(self):
+        # minimum backoff is always 20
+        self._test_backoff(20, check_cluster_every=1)
+
+
+class LogAddressOfMasterTestCase(MockBoto3TestCase):
+    """Test that we log the address of the master node."""
+
+    def setUp(self):
+        super(LogAddressOfMasterTestCase, self).setUp()
+
+        self.log = self.start(patch('mrjob.emr.log'))
+
+    def _num_times_address_of_master_logged(self):
+        return sum(1 for args, kwargs in self.log.info.call_args_list
+                   if args[0].strip().startswith('master node is '))
+
+    def test_basic(self):
+        job = MRTwoStepJob(['-r', 'emr'])
+        job.sandbox()
+
+        with job.make_runner() as runner:
+            runner.run()
+
+        self.assertEqual(self._num_times_address_of_master_logged(), 1)
+
+    def test_pooled_cluster(self):
+        job1 = MRTwoStepJob(['-r', 'emr', '--pool-clusters'])
+        job1.sandbox()
+        with job1.make_runner() as runner:
+            runner.run()
+
+        self.log.info.reset_mock()
+
+        job2 = MRTwoStepJob(['-r', 'emr', '--pool-clusters'])
+        job2.sandbox()
+        with job2.make_runner() as runner:
+            runner.run()
+
+        self.assertEqual(self._num_times_address_of_master_logged(), 1)
+
+    def test_relaunch_pooled_cluster(self):
+        job1 = MRTwoStepJob(['-r', 'emr', '--pool-clusters'])
+        job1.sandbox()
+        with job1.make_runner() as runner:
+            runner.run()
+            cluster_id = runner.get_cluster_id()
+
+        self.log.info.reset_mock()
+
+        self.mock_emr_self_termination.add(cluster_id)
+
+        job2 = MRTwoStepJob(['-r', 'emr', '--pool-clusters'])
+        job2.sandbox()
+        with job2.make_runner() as runner:
+            runner.run()
+
+        self.assertEqual(self._num_times_address_of_master_logged(), 2)

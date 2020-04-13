@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 # Copyright 2015-2017 Yelp
 # Copyright 2018 Yelp and Google, Inc.
+# Copyright 2019 Yelp
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -18,9 +19,9 @@ Hadoop streaming command (we call them this because EMR puts them
 in the steps/ subdir of the logs on S3)."""
 import errno
 import re
+import logging
 from logging import getLogger
 
-from mrjob.py2 import to_unicode
 from .ids import _add_implied_job_id
 from .ids import _add_implied_task_id
 from .log4j import _parse_hadoop_log4j_records
@@ -204,36 +205,37 @@ def _interpret_emr_step_stderr(fs, matches):
     return {}
 
 
-def _interpret_hadoop_jar_command_stderr(stderr, record_callback=None):
-    """Parse stderr from the ``hadoop jar`` command. Works like
-    :py:func:`_parse_step_syslog` (same return format)  with a few extra
-    features to handle the output of the ``hadoop jar`` command on the fly:
+def _eio_to_eof(pty_master):
+    """Yield lines from a PTY, gracefully handling an ``IOError`` with
+    ``errno == EIO`` as end-of-file."""
+    try:
+        for line in pty_master:
+            yield line
+    except IOError as e:
+        # this is just the PTY's way of saying goodbye
+        if e.errno == errno.EIO:
+            return
+        else:
+            raise
 
-    - Converts ``bytes`` lines to ``str``
+
+def _interpret_hadoop_jar_command_stderr(lines, record_callback=None):
+    """Parse *lines* from the ``hadoop jar`` command's stderr (lines can be
+    either bytes or unicode). Works like :py:func:`_parse_step_syslog` (same
+    return format) with a few extra features to handle the output of the
+    ``hadoop jar`` command on the fly:
+
     - Pre-filters non-log4j stuff from Hadoop Streaming so it doesn't
       get treated as part of a multi-line message
-    - Handles "stderr" from a PTY (including treating EIO as EOF and
-      pre-filtering stdout lines from Hadoop Streaming)
     - Optionally calls *record_callback* for each log4j record (see
       :py:func:`~mrjob.logs.log4j._parse_hadoop_log4j_records`).
     """
-    def yield_lines():
-        try:
-            for line in stderr:
-                yield to_unicode(line)
-        except IOError as e:
-            # this is just the PTY's way of saying goodbye
-            if e.errno == errno.EIO:
-                return
-            else:
-                raise
-
     def pre_filter(line):
         return bool(_HADOOP_STREAMING_NON_LOG4J_LINE_RE.match(line))
 
     def yield_records():
-        for record in _parse_hadoop_log4j_records(yield_lines(),
-                                                  pre_filter=pre_filter):
+        for record in _parse_hadoop_log4j_records(
+                lines, pre_filter=pre_filter):
             if record_callback:
                 record_callback(record)
             yield record
@@ -395,3 +397,17 @@ def _parse_indented_counters(lines):
             log.warning('unexpected counter line: %s' % line)
 
     return counters
+
+
+def _log_line_from_driver(line, level=None):
+    """Log ``'  <line>'``. *line* should be a string.
+
+    Optionally specify a logging level (default is logging.INFO).
+    """
+    log.log(level or logging.INFO, '  %s' % line)
+
+
+def _log_log4j_record(record):
+    """Log a log4j message at the appropriate logging level"""
+    level = getattr(logging, record.get('level') or '', None)
+    _log_line_from_driver(record['message'], level=level)

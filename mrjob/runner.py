@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 # Copyright 2009-2017 Yelp and Contributors
 # Copyright 2018 Yelp and Google, Inc.
+# Copyright 2019 Yelp
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -23,15 +24,16 @@ import os.path
 import posixpath
 import pprint
 import re
-import shutil
 import sys
 import tarfile
 import tempfile
 import uuid
+from shutil import rmtree
 
 from mrjob.compat import translate_jobconf
 from mrjob.compat import translate_jobconf_dict
 from mrjob.compat import translate_jobconf_for_all_versions
+from mrjob.conf import ClearedValue
 from mrjob.conf import combine_jobconfs
 from mrjob.conf import combine_opts
 from mrjob.conf import load_opts_from_mrjob_confs
@@ -41,15 +43,16 @@ from mrjob.options import _combiners
 from mrjob.options import _deprecated_aliases
 from mrjob.options import CLEANUP_CHOICES
 from mrjob.parse import is_uri
+from mrjob.parse import to_uri
 from mrjob.py2 import PY2
 from mrjob.py2 import string_types
 from mrjob.setup import WorkingDirManager
 from mrjob.setup import name_uniquely
 from mrjob.setup import parse_legacy_hash_path
+from mrjob.step import INPUT
 from mrjob.step import OUTPUT
 from mrjob.step import _is_spark_step_type
 from mrjob.step import _is_pyspark_step_type
-from mrjob.util import to_lines
 
 
 log = logging.getLogger(__name__)
@@ -97,6 +100,7 @@ class MRJobRunner(object):
         'label',
         'libjars',
         'local_tmp_dir',
+        # no max_output_files because it doesn't go in self._opts
         'owner',
         'py_files',
         'read_logs',
@@ -116,7 +120,7 @@ class MRJobRunner(object):
     ### methods to call from your batch script ###
 
     def __init__(self, mr_job_script=None, conf_paths=None,
-                 extra_args=None, file_upload_args=None,
+                 extra_args=None,
                  hadoop_input_format=None, hadoop_output_format=None,
                  input_paths=None, output_dir=None, partitioner=None,
                  sort_values=None, stdin=None, steps=None,
@@ -137,13 +141,6 @@ class MRJobRunner(object):
         :param extra_args: a list of extra cmd-line arguments to pass to the
                            mr_job script. This is a hook to allow jobs to take
                            additional arguments.
-        :param file_upload_args: a list of tuples of ``('--ARGNAME', path)``.
-                                 The file at the given path will be uploaded
-                                 to the local directory of the mr_job script
-                                 when it runs, and then passed into the script
-                                 with ``--ARGNAME``. Useful for passing in
-                                 SQLite DBs and other configuration files to
-                                 your job.
         :type hadoop_input_format: str
         :param hadoop_input_format: name of an optional Hadoop ``InputFormat``
                                     class. Passed to Hadoop along with your
@@ -241,13 +238,12 @@ class MRJobRunner(object):
         # set of dir_archives that have actually been created
         self._dir_archives_created = set()
 
-        # track (name, path) of files and archives to upload to spark
-        # if not using a setup script.
-        self._spark_files = []
-        self._spark_archives = []
-
         # set this to an :py:class:`~mrjob.setup.UploadDirManager` in
         # runners that upload files to HDFS, S3, etc.
+        #
+        # this manager should not handle files belonging to
+        # self._working_dir_mgr,
+        # which, if they are uploaded, will go into self._wd_upload_dir()
         self._upload_mgr = None
 
         self._script_path = mr_job_script
@@ -264,31 +260,17 @@ class MRJobRunner(object):
                 if extra_arg.get('type') != 'file':
                     raise NotImplementedError
                 self._working_dir_mgr.add(**extra_arg)
-                self._spark_files.append(
-                    (extra_arg['name'], extra_arg['path']))
-
-        # extra file arguments to our job
-        if file_upload_args:
-            log.warning('file_upload_args is deprecated and will be removed'
-                        ' in v0.6.0. Pass dicts to extra_args instead.')
-            for arg, path in file_upload_args:
-                arg_file = parse_legacy_hash_path('file', path)
-                self._working_dir_mgr.add(**arg_file)
-                self._extra_args.extend([arg, arg_file])
-                self._spark_files.append((arg_file['name'], arg_file['path']))
 
         # set up uploading
         for hash_path in self._opts['upload_files']:
             uf = parse_legacy_hash_path('file', hash_path,
                                         must_name='upload_files')
             self._working_dir_mgr.add(**uf)
-            self._spark_files.append((uf['name'], uf['path']))
 
         for hash_path in self._opts['upload_archives']:
             ua = parse_legacy_hash_path('archive', hash_path,
                                         must_name='upload_archives')
             self._working_dir_mgr.add(**ua)
-            self._spark_archives.append((ua['name'], ua['path']))
 
         for hash_path in self._opts['upload_dirs']:
             # pick name based on directory path
@@ -298,7 +280,6 @@ class MRJobRunner(object):
             archive_path = self._dir_archive_path(ud['path'])
             self._working_dir_mgr.add(
                 'archive', archive_path, name=ud['name'])
-            self._spark_archives.append((ud['name'], archive_path))
 
         # Where to read input from (log files, etc.)
         self._input_paths = input_paths or ['-']  # by default read from stdin
@@ -328,12 +309,8 @@ class MRJobRunner(object):
         self._hadoop_output_format = hadoop_output_format
 
         # check and store *steps*
-        self._steps = None
-        if steps is None:
-            if not mr_job_script:
-                self._steps = []
-            # otherwise we'll load steps on-the-fly, see _load_steps()
-        else:
+        self._steps = []
+        if steps:
             self._check_steps(steps)
             self._steps = copy.deepcopy(steps)
 
@@ -343,7 +320,8 @@ class MRJobRunner(object):
 
     ### Options ####
 
-    def _default_opts(self):
+    @classmethod
+    def _default_opts(cls):
         try:
             owner = getpass.getuser()
         except:
@@ -430,7 +408,15 @@ class MRJobRunner(object):
                 k = aliased_opt
 
             if k in self.OPT_NAMES:
-                results[k] = None if v is None else self._fix_opt(k, v, source)
+                if v is None:
+                    fixed_v = None
+                elif isinstance(v, ClearedValue):
+                    # _fix_opt() doesn't need to know about !clear (see #2102)
+                    fixed_v = ClearedValue(self._fix_opt(k, v.value, source))
+                else:
+                    fixed_v = self._fix_opt(k, v, source)
+
+                results[k] = fixed_v
             elif v:
                 log.warning('Unexpected option %s (from %s)' % (k, source))
 
@@ -481,9 +467,10 @@ class MRJobRunner(object):
         filesystem.
         """
         if self._fs is None:
-            # wrap LocalFilesystem in CompositeFilesystem to get IOError
+            # wrap LocalFilesystem in LocalFilesystem to get IOError
             # on URIs (see #1185)
-            self._fs = CompositeFilesystem(LocalFilesystem())
+            self._fs = CompositeFilesystem()
+            self._fs.add_fs('local', LocalFilesystem())
         return self._fs
 
     ### Running the job and parsing output ###
@@ -518,13 +505,17 @@ class MRJobRunner(object):
             log.info('job output is in %s' % self._output_dir)
 
     def cat_output(self):
-        """Stream the jobs output, as a stream of ``bytes``. If there are
+        """Stream the job's output, as a stream of ``bytes``. If there are
         multiple output files, there will be an empty bytestring
         (``b''``) between them.
 
-        .. versionadded:: 0.6.0
+        Like Hadoop input formats, we ignore files and subdirectories whose
+        names start with ``"_"`` or ``"."`` (e.g. ``_SUCCESS``, ``_logs/``,
+        ``.part-00000.crc``.
 
-           In previous versions, you'd use :py:meth:`stream_output`.
+        .. versionchanged:: 0.6.8
+
+           Ignore file/dirnames starting with ``"."`` as well as ``"_"``.
         """
         output_dir = self.get_output_dir()
         if output_dir is None:
@@ -552,7 +543,9 @@ class MRJobRunner(object):
         def ls_output():
             for filename in self.fs.ls(output_dir):
                 subpath = filename[len(output_dir):]
-                if not (any(name.startswith('_')
+                # Hadoop ignores files and dirs inside the output dir
+                # whose names start with '_' or '.'. See #1337.
+                if not (any(name[0] in '_.'
                             for name in split_path(subpath))):
                     yield filename
 
@@ -562,18 +555,6 @@ class MRJobRunner(object):
 
             for chunk in self.fs._cat_file(filename):
                 yield chunk
-
-    def stream_output(self):
-        """Like :py:meth:`cat_output` except that it groups bytes into
-        lines. Equivalent to ``mrjob.util.to_lines(runner.cat_output())``.
-
-        .. deprecated:: 0.6.0
-        """
-        log.warning('stream_output() is deprecated and will be removed in'
-                    ' v0.7.0. use mrjob.util.to_lines(runner.cat_output())'
-                    ' instead.')
-
-        return to_lines(self.cat_output())
 
     def _cleanup_mode(self, mode=None):
         """Actual cleanup action to take based on various options"""
@@ -609,7 +590,7 @@ class MRJobRunner(object):
         if self._local_tmp_dir:
             log.info('Removing temp directory %s...' % self._local_tmp_dir)
             try:
-                shutil.rmtree(self._local_tmp_dir)
+                rmtree(self._local_tmp_dir)
             except OSError as e:
                 log.exception(e)
 
@@ -745,7 +726,7 @@ class MRJobRunner(object):
             path = os.path.join(tmp_dir, self._job_key)
             log.info('Creating temp directory %s' % path)
             if os.path.isdir(path):
-                shutil.rmtree(path)
+                rmtree(path)
             os.makedirs(path)
             self._local_tmp_dir = path
 
@@ -791,32 +772,10 @@ class MRJobRunner(object):
             return 'no_user'
 
     def _get_steps(self):
-        """If *steps* was not set at init time, call the job script to
-        find out how many steps it has, and whether
-        there are mappers and reducers for each step. Validate its
-        output.
-
-        Returns output as described in :ref:`steps-format`.
+        """Returns ``self._steps``.
         """
-        if self._steps is None:
-            log.warning(
-                'querying jobs for steps is deprecated and'
-                ' will go away in v0.7.0')
-            steps = self._load_steps()
-            self._check_steps(steps)
-            self._steps = steps
-
+        # TODO: remove this
         return self._steps
-
-    def _load_steps(self):
-        """Ask job how many steps it has, and whether
-        there are mappers and reducers for each step.
-
-        Returns output as described in :ref:`steps-format`.
-
-        If this is called, you can assume self._script_path is set.
-        """
-        raise NotImplementedError
 
     def _check_steps(self, steps):
         """Look at the step definition (*steps*). If it is not supported by
@@ -830,34 +789,46 @@ class MRJobRunner(object):
                 '%s cannot run steps!' % self.__class__.__name__)
 
         for step_num, step in enumerate(steps):
-            if step.get('type') not in self._STEP_TYPES:
-                raise NotImplementedError(
-                    'step %d has type %r, but %s runner only supports:'
-                    ' %s' % (step_num, step.get('type'), self.alias,
-                             ', '.join(sorted(self._STEP_TYPES))))
+            self._check_step(step, step_num)
 
-            if step.get('input_manifest') and step_num != 0:
+    def _check_step(self, step, step_num):
+        """Raise an exception if the given step is invalid
+        (:py:class:`ValueError`) or not handled by this runner
+        (:py:class:`NotImplementedError`).
+
+        By default, we check that *step* has a support step type,
+        only uses an input manifest if it's the first step, and that
+        :py:attr:`_script_path` exists if necessary. You can re-define
+        this in your subclass.
+        """
+        if step.get('type') not in self._STEP_TYPES:
+            raise NotImplementedError(
+                'step %d has type %r, but %s runner only supports:'
+                ' %s' % (step_num, step.get('type'), self.alias,
+                         ', '.join(sorted(self._STEP_TYPES))))
+
+        if step.get('input_manifest') and step_num != 0:
+            raise ValueError(
+                'step %d may not take an input manifest (only'
+                ' first step can' % step_num)
+
+        # some step types assume a MRJob script
+        if not self._script_path:
+            if step['type'] == 'spark':
                 raise ValueError(
-                    'step %d may not take an input manifest (only'
-                    ' first step can' % step_num)
+                    "SparkStep (step %d) can't run without a MRJob script"
+                    " (try SparkScriptStep instead)" % step_num)
 
-            # some step types assume a MRJob script
-            if not self._script_path:
-                if step['type'] == 'spark':
-                    raise ValueError(
-                        "SparkStep (step %d) can't run without a MRJob script"
-                        " (try SparkScriptStep instead)" % step_num)
+            elif step['type'] == 'streaming':
+                for mrc in ('mapper', 'combiner', 'reducer'):
+                    if not step.get(mrc):
+                        continue
 
-                elif step['type'] == 'streaming':
-                    for mrc in ('mapper', 'combiner', 'reducer'):
-                        if not step.get(mrc):
-                            continue
-
-                        substep = step[mrc]
-                        if substep['type'] == 'script':
-                            raise ValueError(
-                                "%s (step %d) can't run without a MRJob"
-                                " script" % (mrc, step_num))
+                    substep = step[mrc]
+                    if substep['type'] == 'script':
+                        raise ValueError(
+                            "%s (step %d) can't run without a MRJob"
+                            " script" % (mrc, step_num))
 
     def _get_step(self, step_num):
         """Get a single step (calls :py:meth:`_get_steps`)."""
@@ -871,7 +842,7 @@ class MRJobRunner(object):
         """Does the first step take an input manifest?"""
         return bool(self._get_step(0).get('input_manifest'))
 
-    def _has_streaming_steps(self):
+    def _has_hadoop_streaming_steps(self):
         """Are any of our steps Hadoop Streaming steps?"""
         return any(step['type'] == 'streaming'
                    for step in self._get_steps())
@@ -882,7 +853,7 @@ class MRJobRunner(object):
 
         Generally used to determine if we need to install Spark on a cluster.
         """
-        return any(_is_spark_step_type(step['type'])
+        return any(self._step_type_uses_spark(step['type'])
                    for step in self._get_steps())
 
     def _has_pyspark_steps(self):
@@ -891,8 +862,48 @@ class MRJobRunner(object):
 
         Generally used to tell if we need a Spark setup script.
         """
-        return any(_is_pyspark_step_type(step['type'])
+        return any(self._step_type_uses_pyspark(step['type'])
                    for step in self._get_steps())
+
+    def _step_type_uses_spark(self, step_type):
+        """Does this step run on Spark?
+
+        (This is re-defined in the Spark runner to include
+        streaming steps, and used by mrjob.logs.mixin)
+        """
+        return _is_spark_step_type(step_type)
+
+    def _step_type_uses_pyspark(self, step_type):
+        """Does this step involve running Python on Spark?
+
+        (This is re-defined in the Spark runner to include
+        streaming steps, and used by mrjob.logs.mixin)
+        """
+        return _is_pyspark_step_type(step_type)
+
+    def _spark_master(self):
+        return self._opts.get('spark_master') or 'local[*]'
+
+    def _spark_deploy_mode(self):
+        return self._opts.get('spark_deploy_mode') or 'client'
+
+    def _spark_driver_has_own_wd(self):
+        """Does the spark driver have a working directory different
+        from the one *spark-submit* was run in?
+
+        (Only true in cluster mode.)
+        """
+        return (self._spark_deploy_mode() == 'cluster' and
+                self._spark_executors_have_own_wd())
+
+    def _spark_executors_have_own_wd(self):
+        """Do spark executors have a working directory different
+        from the one *spark-submit* was run in?
+
+        (True on everything but local.)
+        """
+        # note: local-cluster[...] master does in fact have working dirs
+        return self._spark_master().split('[')[0] != 'local'
 
     def _args_for_task(self, step_num, mrc):
         return [
@@ -917,6 +928,55 @@ class MRJobRunner(object):
                     result.append(self._working_dir_mgr.name(**extra_arg))
             else:
                 result.append(extra_arg)
+
+        return result
+
+    def _spark_script_args(self, step_num, last_step_num=None):
+        """A list of args to the spark script/jar/MRJob, used by
+        _args_for_spark_step().
+
+        *last_step_num* is only used by the Spark runner, where multiple
+        streaming steps are run in a single Spark job."""
+        step = self._get_step(step_num)
+
+        if step['type'] == 'spark':
+            # if on local[*] master, keep file upload args as-is (see #2031)
+            local = not self._spark_executors_have_own_wd()
+
+            args = (
+                [
+                    '--step-num=%d' % step_num,
+                    '--spark',
+                ] + self._mr_job_extra_args(local=local) + [
+                    INPUT,
+                    OUTPUT,
+                ]
+            )
+        elif step['type'] in ('spark_jar', 'spark_script'):
+            args = step['args']
+        else:
+            raise TypeError('Bad step type: %r' % step['type'])
+
+        return self._interpolate_step_args(args, step_num)
+
+    def _interpolate_step_args(self, args, step_num):
+        """Replace :py:data:`~mrjob.step.INPUT` and
+        :py:data:`~mrjob.step.OUTPUT` in arguments to a jar or Spark
+        step.
+        """
+        result = []
+
+        for arg in args:
+            if arg == INPUT:
+                result.append(
+                    ','.join(self._step_input_uris(step_num)))
+
+            elif arg == OUTPUT:
+                result.append(
+                    self._step_output_uri(step_num))
+
+            else:
+                result.append(arg)
 
         return result
 
@@ -993,7 +1053,7 @@ class MRJobRunner(object):
     def _bootstrap_mrjob(self):
         """Should we bootstrap mrjob?"""
         if self._opts['bootstrap_mrjob'] is None:
-            return self._opts['interpreter'] is None
+            return True
         else:
             return bool(self._opts['bootstrap_mrjob'])
 
@@ -1042,7 +1102,7 @@ class MRJobRunner(object):
                 if self._upload_mgr:
                     uris.append(self._upload_mgr.uri(path))
                 else:
-                    # just make sure job can find files from it's working dir
+                    # just make sure job can find files from its working dir
                     uris.append(os.path.abspath(path))
 
         log.info('found %d input files' % len(uris))
@@ -1083,8 +1143,119 @@ class MRJobRunner(object):
             for path in self._get_input_paths():
                 self._upload_mgr.add(path)
 
-    def _intermediate_output_uri(self, step_num, local=False):
-        """A URI for intermediate output for the given step number."""
+    def _upload_local_files(self):
+        self._copy_files_to_wd_mirror()
+
+        if self._upload_mgr:
+            self.fs.mkdir(self._upload_mgr.prefix)
+
+            log.info('Copying other local files to %s' %
+                     self._upload_mgr.prefix)
+            for src_path, uri in self._upload_mgr.path_to_uri().items():
+                log.debug('  %s -> %s' % (src_path, uri))
+                self.fs.put(src_path, uri)
+
+    def _wd_mirror(self):
+        """A directory to upload files belonging to
+        :py:attr:`_working_dir_mgr`. This will be a subdir of
+        ``self._upload_mgr.prefix`, if it exists, and otherwise will
+        be ``None``."""
+        if self._upload_mgr and is_uri(self._upload_mgr.prefix):
+            return posixpath.join(self._upload_mgr.prefix, 'wd')
+        elif (self._has_spark_steps() and self._spark_executors_have_own_wd()):
+            return os.path.join(self._get_local_tmp_dir(), 'wd-mirror')
+        else:
+            return None
+
+    def _wd_filenames_must_match(self):
+        """When we tell Hadoop/Spark to put files in the working directory,
+        must they have the same names as the files in the working dir?
+
+        This basically only happens with Spark on non-YARN masters. YARN/Hadoop
+        allows you to specify a name for each file (``path#name_in_wd``).
+        """
+        return self._has_spark_steps() and self._spark_master() != 'yarn'
+
+    def _dest_in_wd_mirror(self, path, name):
+        """Return the URI of where to upload *path* so it can appear in the
+        working dir as *name*, or ``None`` if it doesn't need to be uploaded.
+        """
+        dest_dir = self._wd_mirror()
+        if not dest_dir:
+            return None
+
+        # the only reason to re-upload a URI is if it has the wrong name
+        #
+        # similarly, the only point of a local working dir mirror is
+        # to rename things
+        if (is_uri(path) or not is_uri(dest_dir)) and (
+                posixpath.basename(path) == name or
+                not self._wd_filenames_must_match()):
+            return None
+
+        return posixpath.join(dest_dir, name)
+
+    def _copy_file_to_wd_mirror(self, path, name):
+        """Upload/copy *path* to the appropriate place in the working dir
+        mirror, if necessary.
+
+        We don't track whether something has already been uploaded.
+        """
+        dest = self._dest_in_wd_mirror(path, name)
+        if not dest:
+            return
+
+        if is_uri(path):
+            # file is visible to non-YARN Spark, but has the wrong name, so
+            # download and re-upload it
+            wd_tmp = os.path.join(self._get_local_tmp_dir(), 'wd-mirror')
+            self.fs.mkdir(wd_tmp)
+
+            tmp_path = os.path.join(wd_tmp, name)
+
+            log.debug('  %s <- %s' % (tmp_path, path))
+            try:
+                with open(tmp_path, 'wb') as tmp_f:
+                    for chunk in self.fs.cat(path):
+                        tmp_f.write(chunk)
+
+                log.debug('  %s -> %s' % (tmp_path, dest))
+                self.fs.put(tmp_path, dest)
+            finally:
+                os.remove(tmp_path)
+        else:
+            # upload it
+            log.debug('  %s -> %s' % (path, dest))
+            self.fs.put(path, dest)
+
+    def _copy_files_to_wd_mirror(self):
+        """Upload working dir files to the working dir mirror, if necessary.
+
+        This does not handle archives, which we always rename with
+        hash paths anyhow (see #2059).
+        """
+        wd_mirror = self._wd_mirror()
+        if not wd_mirror:
+            return
+
+        self.fs.mkdir(wd_mirror)
+
+        log.info('%s working dir files to %s...' %
+                 ('uploading' if is_uri(wd_mirror) else 'copying', wd_mirror))
+        for name, path in sorted(
+                self._working_dir_mgr.name_to_path('file').items()):
+            self._copy_file_to_wd_mirror(path, name)
+
+    def _upload_part_size(self):
+        """Part size for uploads, in bytes, or ``None``,
+        from :mrjob-opt:`cloud_part_size_mb`"""
+        if self._opts.get('cloud_part_size_mb'):
+            return int(self._opts['cloud_part_size_mb'] * 1024 * 1024)
+        else:
+            return None
+
+    def _intermediate_output_dir(self, step_num, local=False):
+        """A directory for intermediate output for the given step number."""
         join = os.path.join if local else posixpath.join
 
         return join(
@@ -1105,19 +1276,20 @@ class MRJobRunner(object):
         except the first step, this list will have a single item (a
         directory)."""
         if step_num == 0:
-            return [self._upload_mgr.uri(path)
+            return [self._upload_mgr.uri(path) if self._upload_mgr
+                    else to_uri(path)
                     for path in self._get_input_paths()]
         else:
-            return [self._intermediate_output_uri(step_num - 1)]
+            return [to_uri(self._intermediate_output_dir(step_num - 1))]
 
     def _step_output_uri(self, step_num):
         """URI to use as output for the given step. This is either an
         intermediate dir (see :py:meth:`intermediate_output_uri`) or
         ``self._output_dir`` for the final step."""
         if step_num == len(self._get_steps()) - 1:
-            return self._output_dir
+            return to_uri(self._output_dir)
         else:
-            return self._intermediate_output_uri(step_num)
+            return to_uri(self._intermediate_output_dir(step_num))
 
     def _jobconf_for_step(self, step_num):
         """Get the jobconf dictionary, optionally including step-specific
@@ -1175,31 +1347,64 @@ class MRJobRunner(object):
         return self._upload_args_helper('-files', None, '-archives', None)
 
     def _upload_args_helper(
-            self, files_opt_str, files, archives_opt_str, archives):
+            self, files_opt_str, files, archives_opt_str, archives,
+            always_use_hash=True):
         args = []
 
-        file_hash_paths = list(self._arg_hash_paths('file', files))
+        file_hash_paths = list(
+            self._file_arg_hash_paths(files,
+                                      always_use_hash=always_use_hash))
         if file_hash_paths:
             args.append(files_opt_str)
             args.append(','.join(file_hash_paths))
 
-        archive_hash_paths = list(self._arg_hash_paths('archive', archives))
+        archive_hash_paths = list(self._archive_arg_hash_paths(archives))
+
         if archive_hash_paths:
             args.append(archives_opt_str)
             args.append(','.join(archive_hash_paths))
 
         return args
 
-    def _arg_hash_paths(self, type, named_paths=None):
-        """Helper function for the *upload_args methods."""
+    def _file_arg_hash_paths(self, named_paths=None, always_use_hash=True):
+        """Helper function for the *upload_args methods. The names of all
+        arguments to ``-files`` (or ``--files`` on Spark).
+
+        If *always_use_hash* is false, only use ``path#name`` syntax
+        when the name is different.
+        """
         if named_paths is None:
-            # just return everything managed by _working_dir_mgr
+            # just return every file managed by _working_dir_mgr
             named_paths = sorted(
-                self._working_dir_mgr.name_to_path(type).items())
+                self._working_dir_mgr.name_to_path('file').items())
 
         for name, path in named_paths:
             if not name:
-                name = self._working_dir_mgr.name(type, path)
+                name = self._working_dir_mgr.name('file', path)
+
+            uri = self._dest_in_wd_mirror(path, name) or path
+
+            if not always_use_hash and _basename(uri) == name:
+                yield uri
+            else:
+                yield '%s#%s' % (uri, name)
+
+    def _archive_arg_hash_paths(self, named_paths=None):
+        """Helper function for the *upload_args methods. The names of all
+        arguments to ``-archives`` (or ``--archives`` on Spark).
+        """
+        # we always use path#name syntax, even on Spark, because unlike
+        # with --files, Spark will either accept that syntax with --archives
+        # (if we're on YARN) or ignore --archives completely (if we're on
+        # any other Spark master)
+        if named_paths is None:
+            # just return every archive managed by _working_dir_mgr
+            named_paths = sorted(
+                self._working_dir_mgr.name_to_path('archive').items())
+
+        for name, path in named_paths:
+            if not name:
+                name = self._working_dir_mgr.name('archive', path)
 
             if self._upload_mgr:
                 uri = self._upload_mgr.uri(path)
@@ -1207,14 +1412,6 @@ class MRJobRunner(object):
                 uri = path
 
             yield '%s#%s' % (uri, name)
-
-    def _upload_uris(self, paths):
-        """If there's an upload manager, convert list of path to list of upload
-        URIs. Otherwise return *paths* as-is"""
-        if self._upload_mgr:
-            return [self._upload_mgr.uri(path) for path in paths]
-        else:
-            return list(paths)
 
     def _write_script(self, lines, path, description):
         """Write text of a setup script, input manifest, etc. to the given
@@ -1305,5 +1502,16 @@ def _runner_class(alias):
         from mrjob.local import LocalMRJobRunner
         return LocalMRJobRunner
 
+    elif alias == 'spark':
+        from mrjob.spark.runner import SparkMRJobRunner
+        return SparkMRJobRunner
+
     else:
         raise ValueError('bad runner alias: %s' % alias)
+
+
+def _basename(path_or_uri):
+    if is_uri(path_or_uri):
+        return posixpath.basename(path_or_uri)
+    else:
+        return os.path.basename(path_or_uri)

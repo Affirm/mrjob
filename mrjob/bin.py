@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 # Copyright 2009-2017 Yelp and Contributors
 # Copyright 2018 Yelp
+# Copyright 2019 Yelp
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -16,28 +17,43 @@
 """Abstract base class for all runners that execute binaries/scripts
 (that is, everything but inline mode).
 """
-import json
 import logging
 import os
 import os.path
 import pipes
 import re
 import sys
+from platform import python_implementation
 from subprocess import Popen
 from subprocess import PIPE
+
+try:
+    import pty
+    pty  # quiet "redefinition of unused ..." warning from pyflakes
+except ImportError:
+    pty = None
+
+try:
+    import pyspark
+    pyspark  # quiet "redefinition of unused ..." warning from pyflakes
+except ImportError:
+    pyspark = None
 
 import mrjob.step
 from mrjob.compat import translate_jobconf
 from mrjob.conf import combine_cmds
 from mrjob.conf import combine_dicts
-from mrjob.conf import combine_local_envs
+from mrjob.logs.log4j import _parse_hadoop_log4j_records
+from mrjob.logs.spark import _parse_spark_log
+from mrjob.logs.step import _eio_to_eof
 from mrjob.py2 import PY2
 from mrjob.py2 import string_types
 from mrjob.runner import MRJobRunner
 from mrjob.setup import parse_setup_cmd
-from mrjob.step import _is_spark_step_type
 from mrjob.util import cmd_line
 from mrjob.util import shlex_split
+from mrjob.util import unique
+from mrjob.util import which
 from mrjob.util import zip_dir
 
 log = logging.getLogger(__name__)
@@ -52,13 +68,10 @@ _MANIFEST_INPUT_FORMAT = 'org.apache.hadoop.mapred.lib.NLineInputFormat'
 class MRJobBinRunner(MRJobRunner):
 
     OPT_NAMES = MRJobRunner.OPT_NAMES | {
-        'interpreter',
         'python_bin',
         'sh_bin',
         'spark_args',
         'spark_submit_bin',
-        'steps_interpreter',
-        'steps_python_bin',
         'task_python_bin',
     }
 
@@ -77,11 +90,6 @@ class MRJobBinRunner(MRJobRunner):
         # interleaved; see mrjob.setup.parse_setup_cmd() for details
         self._setup = [parse_setup_cmd(cmd) for cmd in self._opts['setup']]
 
-        if self._setup and self._has_pyspark_steps() and not (
-                self._spark_setup_is_supported()):
-            log.warning("setup commands aren't supported on Spark master %r" %
-                        self._spark_master())
-
         for cmd in self._setup:
             for token in cmd:
                 if isinstance(token, dict):
@@ -93,22 +101,32 @@ class MRJobBinRunner(MRJobRunner):
 
                     self._working_dir_mgr.add(**token)
 
+        # warning: no setup scripts on Spark when no working dir
+        if self._setup and self._has_pyspark_steps() and not(
+                self._spark_executors_have_own_wd()):
+            log.warning("setup commands aren't supported on Spark master %r" %
+                        self._spark_master())
+
         # --py-files on Spark doesn't allow '#' (see #1375)
         if any('#' in path for path in self._opts['py_files']):
             raise ValueError("py_files cannot contain '#'")
 
-        # interpolate job key into cmdenvs
+        # Keep track of where the spark-submit binary is
+        self._spark_submit_bin = self._opts['spark_submit_bin']
+
+        # AFFIRM: parameterized cmdenv
+        # See commit af0c15f197bc048081daddb3c62fbc40ea38ff12
         for key, value in self._opts['cmdenv'].items():
             if '%s' in value:
                 job_key = self._job_key.replace('.', '_')
                 self._opts['cmdenv'][key] = value % job_key
 
-    def _default_opts(self):
+    @classmethod
+    def _default_opts(cls):
         return combine_dicts(
-            super(MRJobBinRunner, self)._default_opts(),
+            super(MRJobBinRunner, cls)._default_opts(),
             dict(
                 read_logs=True,
-                sh_bin=['/bin/sh', '-ex'],
             )
         )
 
@@ -117,14 +135,15 @@ class MRJobBinRunner(MRJobRunner):
         opt_value = super(MRJobBinRunner, self)._fix_opt(
             opt_key, opt_value, source)
 
+        # check that sh_bin doesn't have too many args
         if opt_key == 'sh_bin':
             # opt_value is usually a string, combiner makes it a list of args
             sh_bin = combine_cmds(opt_value)
 
-            if len(sh_bin) == 0:
-                raise ValueError('sh_bin (from %s) may not be empty!' % source)
+            # empty sh_bin just means to use the default, see #1926
+
             # make these hard requirements in v0.7.0?
-            elif len(sh_bin) > 1 and not os.path.isabs(sh_bin[0]):
+            if len(sh_bin) > 1 and not os.path.isabs(sh_bin[0]):
                 log.warning('sh_bin (from %s) should use an absolute path'
                             ' if you want it to take arguments' % source)
             elif len(sh_bin) > 2:
@@ -133,62 +152,16 @@ class MRJobBinRunner(MRJobRunner):
 
         return opt_value
 
-    def _load_steps(self):
-        args = (self._executable(True) + ['--steps'] +
-                self._mr_job_extra_args(local=True))
-        log.debug('> %s' % cmd_line(args))
-
-        # add . to PYTHONPATH (in case mrjob isn't actually installed)
-        env = combine_local_envs(os.environ,
-                                 {'PYTHONPATH': os.path.abspath('.')})
-        steps_proc = Popen(args, stdout=PIPE, stderr=PIPE, env=env)
-        stdout, stderr = steps_proc.communicate()
-
-        if steps_proc.returncode != 0:
-            raise Exception(
-                'error getting step information: \n%s' % stderr)
-
-        # on Python 3, convert stdout to str so we can json.loads() it
-        if not isinstance(stdout, str):
-            stdout = stdout.decode('utf_8')
-
-        try:
-            steps = json.loads(stdout)
-        except ValueError:
-            raise ValueError("Bad --steps response: \n%s" % stdout)
-
-        # verify that this is a proper step description
-        if not steps or not stdout:
-            raise ValueError('step description is empty!')
-
-        return steps
-
-    ### interpreter/python binary ###
-
-    def _interpreter(self, steps=False):
-        if steps:
-            return (self._opts['steps_interpreter'] or
-                    self._opts['interpreter'] or
-                    self._steps_python_bin())
-        else:
-            return (self._opts['interpreter'] or
-                    self._task_python_bin())
-
-    def _executable(self, steps=False):
-        if steps:
-            return self._interpreter(steps=True) + [self._script_path]
-        else:
-            return self._interpreter() + [
-                self._working_dir_mgr.name('file', self._script_path)]
+    ### python binary ###
 
     def _python_bin(self):
         """Python binary used for everything other than invoking the job.
-        For invoking jobs with ``--steps``, see :py:meth:`_steps_python_bin`,
-        and for everything else (e.g. ``--mapper``, ``--spark``), see
-        :py:meth:`_task_python_bin`, which defaults to this method if
-        :mrjob-opt:`task_python_bin` isn't set.
 
-        Other ways mrjob uses Python:
+        For running job tasks (e.g. ``--mapper``, ``--spark``), we use
+        :py:meth:`_task_python_bin`, which can be set to a different value
+        by setting :mrjob-opt:`task_python_bin`.
+
+        Ways mrjob uses Python other than running tasks:
          * file locking in setup wrapper scripts
          * finding site-packages dir to bootstrap mrjob on clusters
          * invoking ``cat.py`` in local mode
@@ -196,11 +169,6 @@ class MRJobBinRunner(MRJobRunner):
         """
         # python_bin isn't an option for inline runners
         return self._opts['python_bin'] or self._default_python_bin()
-
-    def _steps_python_bin(self):
-        """Python binary used to invoke job with ``--steps``"""
-        return (self._opts['steps_python_bin'] or
-                self._default_python_bin(local=True))
 
     def _task_python_bin(self):
         """Python binary used to invoke job with ``--mapper``,
@@ -214,18 +182,28 @@ class MRJobBinRunner(MRJobRunner):
 
         This returns a single-item list (because it's a command).
         """
+        major_version = sys.version_info[0]
+        is_pypy = (python_implementation() == 'PyPy')
+
         if local and sys.executable:
             return [sys.executable]
         elif PY2:
-            return ['python']
+            if is_pypy:
+                return ['pypy']
+            else:
+                return ['python']
         else:
-            # e.g. python3
-            return ['python%d' % sys.version_info[0]]
+            if is_pypy:
+                return ['pypy%d' % major_version]
+            else:
+                return ['python%d' % major_version]
 
     ### running MRJob scripts ###
 
     def _script_args_for_step(self, step_num, mrc, input_manifest=False):
-        args = self._executable() + self._args_for_task(step_num, mrc)
+        args = (self._task_python_bin() +
+                [self._working_dir_mgr.name('file', self._script_path)] +
+                self._args_for_task(step_num, mrc))
 
         if input_manifest and mrc == 'mapper':
             wrapper = self._manifest_setup_script_path
@@ -399,12 +377,9 @@ class MRJobBinRunner(MRJobRunner):
         """
         return self._opts['libjars']
 
-    def _interpolate_step_args(self, args, step_num):
-        """Replace :py:data:`~mrjob.step.INPUT` and
-        :py:data:`~mrjob.step.OUTPUT` in arguments to a jar or Spark
-        step.
-
-        Also replaces `~mrjob.step.GENERIC_ARGS` with
+    def _interpolate_jar_step_args(self, args, step_num):
+        """Like :py:meth:`_interpolate_step_args` except it
+        also replaces `~mrjob.step.GENERIC_ARGS` with
         :py:meth:`_hadoop_generic_args_for_step`. This only
         makes sense for jar steps; Spark should raise an error
         if `~mrjob.step.GENERIC_ARGS` is encountered.
@@ -415,19 +390,10 @@ class MRJobBinRunner(MRJobRunner):
             if arg == mrjob.step.GENERIC_ARGS:
                 result.extend(
                     self._hadoop_generic_args_for_step(step_num))
-
-            elif arg == mrjob.step.INPUT:
-                result.append(
-                    ','.join(self._step_input_uris(step_num)))
-
-            elif arg == mrjob.step.OUTPUT:
-                result.append(
-                    self._step_output_uri(step_num))
-
             else:
                 result.append(arg)
 
-        return result
+        return self._interpolate_step_args(result, step_num)
 
     ### setup scripts ###
 
@@ -455,7 +421,7 @@ class MRJobBinRunner(MRJobRunner):
         If *local* is true, use local line endings (e.g. Windows). Otherwise,
         use UNIX line endings (see #1071).
         """
-        if self._has_streaming_steps():
+        if self._has_hadoop_streaming_steps():
             streaming_setup = self._py_files_setup() + self._setup
 
             if streaming_setup and not self._setup_wrapper_script_path:
@@ -481,21 +447,9 @@ class MRJobBinRunner(MRJobRunner):
                 wrap_python=True)
 
     def _uses_spark_setup_script(self):
-        if not self._has_pyspark_steps():
-            return False
-
-        if not self._setup:
-            return False  # nothing to do
-
-        if not self._spark_setup_is_supported():
-            return False
-
-        return True
-
-    def _spark_setup_is_supported(self):
-        """Can we run setup scripts on Spark?"""
-        # for now, we only support setup scripts on YARN (see #1376)
-        return self._spark_master() == 'yarn'
+        return (self._setup and
+                self._has_pyspark_steps() and
+                self._spark_executors_have_own_wd())
 
     def _py_files_setup(self):
         """A list of additional setup commands to emulate Spark's
@@ -779,7 +733,11 @@ class MRJobBinRunner(MRJobRunner):
         if, for example, a runner needs different default values
         depending on circumstances (see :py:class:`~mrjob.emr.EMRJobRunner`).
         """
-        return self._opts['sh_bin']
+        return self._opts['sh_bin'] or self._default_sh_bin()
+
+    def _default_sh_bin(self):
+        """The default sh binary, if :mrjob-opt:`sh_bin` isn't set."""
+        return ['/bin/sh', '-ex']
 
     def _sh_pre_commands(self):
         """A list of lines to put at the very start of any sh script
@@ -799,68 +757,156 @@ class MRJobBinRunner(MRJobRunner):
 
     ### spark ###
 
-    def _args_for_spark_step(self, step_num):
+    def _args_for_spark_step(self, step_num, last_step_num=None):
         """The actual arguments used to run the spark-submit command.
 
         This handles both all Spark step types (``spark``, ``spark_jar``,
         and ``spark_script``).
+
+        *last_step_num* is only used by the Spark runner, where multiple
+        streaming steps are run in a single Spark job
         """
         return (
             self.get_spark_submit_bin() +
             self._spark_submit_args(step_num) +
             [self._spark_script_path(step_num)] +
-            self._spark_script_args(step_num)
+            self._spark_script_args(step_num, last_step_num)
         )
 
-    def _spark_script_args(self, step_num):
-        """A list of args to the spark script/jar, used by
-        _args_for_spark_step()."""
-        step = self._get_step(step_num)
+    def _run_spark_submit(self, spark_submit_args, env, record_callback):
+        """Run the spark submit binary in a subprocess, using a PTY if possible
 
-        if step['type'] == 'spark':
-            args = (
-                [
-                    '--step-num=%d' % step_num,
-                    '--spark',
-                ] + self._mr_job_extra_args() + [
-                    mrjob.step.INPUT,
-                    mrjob.step.OUTPUT,
-                ]
-            )
-        elif step['type'] in ('spark_jar', 'spark_script'):
-            args = step['args']
+        :param spark_submit_args: spark-submit binary and arguments, as as list
+        :param env: environment variables, as a dict
+        :param record_callback: a function that takes a single log4j record
+                                as its argument (see
+                                :py:func:`~mrjob.logs.log4j\
+                                ._parse_hadoop_log4j_records)
 
-            if mrjob.step.GENERIC_ARGS in args:
-                raise ValueError(
-                    'GENERIC_ARGS is not allowed in spark steps')
+        :return: tuple of the subprocess's return code and a
+                 step interpretation dictionary
+        """
+        log.debug('> %s' % cmd_line(spark_submit_args))
+        log.debug('  with environment: %r' % sorted(env.items()))
+
+        # these should always be set, but just in case
+        returncode = 0
+        step_interpretation = {}
+
+        # try to use a PTY if it's available
+        try:
+            pid, master_fd = pty.fork()
+        except (AttributeError, OSError):
+            # no PTYs, just use Popen
+
+            # user won't get much feedback for a while, so tell them
+            # spark-submit is running
+            log.debug('No PTY available, using Popen() to invoke spark-submit')
+
+            step_proc = Popen(
+                spark_submit_args, stdout=PIPE, stderr=PIPE, env=env)
+
+            # parse driver output
+            step_interpretation = _parse_spark_log(
+                step_proc.stderr, record_callback=record_callback)
+
+            # there shouldn't be much output on STDOUT, just echo it
+            for record in _parse_hadoop_log4j_records(step_proc.stdout):
+                record_callback(record)
+
+            step_proc.stdout.close()
+            step_proc.stderr.close()
+
+            returncode = step_proc.wait()
         else:
-            raise TypeError('Bad step type: %r' % step['type'])
+            # we have PTYs
+            if pid == 0:  # we are the child process
+                try:
+                    os.execvpe(spark_submit_args[0], spark_submit_args, env)
+                    # now this process is no longer Python
+                except OSError as ex:
+                    # use _exit() so we don't do cleanup, etc. that's
+                    # the parent process's job
+                    os._exit(ex.errno)
+                finally:
+                    # if we get some other exception, still exit hard
+                    os._exit(-1)
+            else:
+                log.debug('Invoking spark-submit via PTY')
 
-        return self._interpolate_step_args(args, step_num)
+                with os.fdopen(master_fd, 'rb') as master:
+                    step_interpretation = (
+                        _parse_spark_log(
+                            _eio_to_eof(master),
+                            record_callback=record_callback))
+
+                    _, returncode = os.waitpid(pid, 0)
+
+        return (returncode, step_interpretation)
 
     def get_spark_submit_bin(self):
-        """The spark-submit command, as a list of args. Re-define
-        this in your subclass for runner-specific behavior.
+        """Return the location of the ``spark-submit`` binary, searching for it
+        if necessary."""
+        if not self._spark_submit_bin:
+            self._spark_submit_bin = self._find_spark_submit_bin()
+        return self._spark_submit_bin
+
+    def _find_spark_submit_bin(self):
+        """Attempt to find the spark binary. Returns a list of arguments.
+        Defaults to ``['spark-submit']``.
+
+        Re-define this in your subclass if you already know where
+        to find spark-submit (e.g. on cloud services).
         """
-        return self._opts['spark_submit_bin'] or ['spark-submit']
+        for path in unique(self._spark_submit_bin_dirs()):
+            log.info('Looking for spark-submit binary in %s...' % (
+                path or '$PATH'))
+
+            spark_submit_bin = which('spark-submit', path=path)
+
+            if spark_submit_bin:
+                log.info('Found spark-submit binary: %s' % spark_submit_bin)
+                return [spark_submit_bin]
+        else:
+            log.info("Falling back to 'spark-submit'")
+            return ['spark-submit']
+
+    def _spark_submit_bin_dirs(self):
+        # $SPARK_HOME
+        spark_home = os.environ.get('SPARK_HOME')
+        if spark_home:
+            yield os.path.join(spark_home, 'bin')
+
+        yield None  # use $PATH
+
+        # look for pyspark installation (see #1984)
+        if pyspark:
+            yield os.path.join(os.path.dirname(pyspark.__file__), 'bin')
+
+        # some other places recommended by install docs (see #1366)
+        yield '/usr/lib/spark/bin'
+        yield '/usr/local/spark/bin'
+        yield '/usr/local/lib/spark/bin'
 
     def _spark_submit_args(self, step_num):
         """Build a list of extra args to the spark-submit binary for
         the given spark or spark_script step."""
         step = self._get_step(step_num)
 
-        if not _is_spark_step_type(step['type']):
-            raise TypeError('non-Spark step: %r' % step)
-
         args = []
 
-        # add --master
-        if self._spark_master():
-            args.extend(['--master', self._spark_master()])
+        # --conf arguments include python bin, cmdenv, jobconf. Make sure
+        # that we can always override these manually
+        jobconf = {}
+        for key, value in self._spark_cmdenv(step_num).items():
+            jobconf['spark.executorEnv.%s' % key] = value
+            if self._spark_master() == 'yarn':  # YARN only, see #1919
+                jobconf['spark.yarn.appMasterEnv.%s' % key] = value
 
-        # add --deploy-mode
-        if self._spark_deploy_mode():
-            args.extend(['--deploy-mode', self._spark_deploy_mode()])
+        jobconf.update(self._jobconf_for_step(step_num))
+
+        for key, value in sorted(jobconf.items()):
+            args.extend(['--conf', '%s=%s' % (key, value)])
 
         # add --class (JAR steps)
         if step.get('main_class'):
@@ -871,24 +917,35 @@ class MRJobBinRunner(MRJobRunner):
         if libjar_paths:
             args.extend(['--jars', ','.join(libjar_paths)])
 
-        # --conf arguments include python bin, cmdenv, jobconf. Make sure
-        # that we can always override these manually
-        jobconf = {}
-        for key, value in self._spark_cmdenv(step_num).items():
-            jobconf['spark.executorEnv.%s' % key] = value
-            jobconf['spark.yarn.appMasterEnv.%s' % key] = value
+        # spark-submit treats --master and --deploy-mode as aliases for
+        # --conf spark.master=... and --conf spark.deploy-mode=... (see #2032).
+        #
+        # we never want jobconf to override spark master or deploy mode, so put
+        # these switches after --conf
 
-        jobconf.update(self._jobconf_for_step(step_num))
+        # add --master
+        if self._spark_master():
+            args.extend(['--master', self._spark_master()])
 
-        for key, value in sorted(jobconf.items()):
-            args.extend(['--conf', '%s=%s' % (key, value)])
+        # add --deploy-mode
+        if self._spark_deploy_mode():
+            args.extend(['--deploy-mode', self._spark_deploy_mode()])
 
         # --files and --archives
         args.extend(self._spark_upload_args())
 
         # --py-files (Python only)
-        if step['type'] in ('spark', 'spark_script'):
-            py_file_uris = self._upload_uris(self._py_files())
+        # spark runner can run 'streaming' steps, so just exclude
+        # non-Python steps
+        if 'jar' not in step['type']:
+            py_file_uris = self._py_files()
+
+            if self._upload_mgr:
+                # don't assume py_files are in _upload_mgr; for example,
+                # spark-submit doesn't need to upload them
+                path_to_uri = self._upload_mgr.path_to_uri()
+                py_file_uris = [path_to_uri.get(p, p) for p in py_file_uris]
+
             if py_file_uris:
                 args.extend(['--py-files', ','.join(py_file_uris)])
 
@@ -896,25 +953,20 @@ class MRJobBinRunner(MRJobRunner):
         args.extend(self._opts['spark_args'])
 
         # step spark_args
-        args.extend(step['spark_args'])
+        if step.get('spark_args'):
+            args.extend(step['spark_args'])
 
         return args
 
-    def _spark_master(self):
-        return self._opts.get('spark_master') or None
-
-    def _spark_deploy_mode(self):
-        return self._opts.get('spark_deploy_mode') or None
-
     def _spark_upload_args(self):
-        # if using a setup script, upload all files to working dir
-        if self._spark_python_wrapper_path:
-            return self._upload_args_helper('--files', None,
-                                            '--archives', None)
+        if self._spark_executors_have_own_wd():
+            return self._upload_args_helper(
+                '--files', None,
+                '--archives', None,
+                always_use_hash=False)
         else:
-            # otherwise, just pass through --files and --archives
-            return self._upload_args_helper('--files', self._spark_files,
-                                            '--archives', self._spark_archives)
+            # don't bother, there's no working dir to upload to
+            return []
 
     def _spark_script_path(self, step_num):
         """The path of the spark script or JAR, used by
@@ -945,14 +997,18 @@ class MRJobBinRunner(MRJobRunner):
 
         cmdenv = {}
 
-        if step['type'] in ('spark', 'spark_script'):  # not spark_jar
+        if self._step_type_uses_pyspark(step['type']):
+            # AFFIRM: Allow for a `cmdenv` (environment variable?) in the path
+            # see commit 54c4138a215e1e87955dede690a2e0120f2fae1d
             driver_python = ' '.join(self._python_bin())
+            #driver_python = cmd_line(self._python_bin())
 
             if self._spark_python_wrapper_path:
                 executor_python = './%s' % self._working_dir_mgr.name(
                     'file', self._spark_python_wrapper_path)
             else:
                 executor_python = ' '.join(self._task_python_bin())
+                #executor_python = cmd_line(self._task_python_bin())
 
             if self._spark_deploy_mode() == 'cluster':
                 # treat driver like executors (they run in same environment)

@@ -39,18 +39,13 @@ options related to file uploading.
     :switch: --bootstrap-mrjob, --no-bootstrap-mrjob
     :type: boolean
     :set: all
-    :default: (automatic)
+    :default: ``True``
 
     Should we automatically zip up the mrjob library and install it when we run
-    job? By default, we do unless :mrjob-opt:`interpreter` (deprecated)
-    is set.
+    job?
 
     Set this to ``False`` if you've already installed ``mrjob`` on your
     Hadoop cluster or install it by some other method.
-
-    .. versionchanged 0.5.7:
-
-    mrjob used to be bootstrapped as a tarball.
 
 .. mrjob-opt::
    :config: py_files
@@ -63,8 +58,6 @@ options related to file uploading.
 
    This is based on a Spark feature, but it works just as well with streaming
    jobs.
-
-   .. versionadded:: 0.5.7
 
    .. versionchanged:: 0.6.7
 
@@ -85,10 +78,6 @@ options related to file uploading.
     ``foo.tar.gz/``, and ``foo.tar.gz#stuff`` is unpacked to the directory
     ``stuff/``).
 
-    .. versionchanged:: 0.5.7
-
-       This works with Spark as well.
-
     .. versionchanged:: 0.6.7
 
        Deprecated :option:`--archive` in favor of :option:`--archives`
@@ -108,9 +97,7 @@ options related to file uploading.
     we copy by appending
     ``#nameinworkingdir`` to the path; otherwise we just use its name.
 
-    This works with Spark as well.
-
-    .. versionadded:: 0.5.8
+    This works with Spark on YARN only.
 
     .. versionchanged:: 0.6.7
 
@@ -137,15 +124,16 @@ options related to file uploading.
 
     On the command line::
 
-        --file file_1.txt --file file_2.sqlite
+        --files file_1.txt,file_2.sqlite
 
-    .. versionchanged:: 0.5.7
+    .. versionchanged:: 0.6.8
 
-       This works with Spark as well.
+       In Spark, can use ``#nameinworkingdir`` even when not on YARN.
 
     .. versionchanged:: 0.6.7
 
        Deprecated :option:`--file` in favor of :option:`--files`
+
 
 Temp files and cleanup
 ======================
@@ -180,10 +168,6 @@ Temp files and cleanup
 
         --cleanup=LOGS,JOB
 
-    .. versionchanged:: 0.5.0
-
-       Options ending in ``TMP`` used to end in ``SCRATCH``
-
 .. mrjob-opt::
    :config: cleanup_on_failure
    :switch: --cleanup-on-failure
@@ -210,10 +194,6 @@ Temp files and cleanup
     .. versionchanged:: 0.6.6
 
        Added `--local-tmp-dir` switch.
-
-    .. versionchanged:: 0.5.0
-
-       This option used to be named ``base_tmp_dir``.
 
 .. mrjob-opt::
    :config: output_dir
@@ -283,32 +263,6 @@ Job execution context
 
         --cmdenv PYTHONPATH=$HOME/stuff,TZ=America/Los_Angeles
 
-    .. versionchanged:: 0.5.7
-
-       This works with Spark too. In client mode (hadoop runner), these
-       environment variables are passed directly to :command:`spark-submit`.
-
-.. mrjob-opt::
-    :config: interpreter
-    :switch: --interpreter
-    :type: :ref:`string <data-type-string>`
-    :set: all
-    :default: ``None``
-
-    .. deprecated:: 0.6.7
-
-       support for non-Python jobs is being phased out.
-
-    Non-Python command to launch your script with (e.g. ``'ruby'``).
-    This will also be used to query the script about steps unless you set
-    :mrjob-opt:`steps_interpreter`.
-
-    If you want to use an alternate Python command to run the job, use
-    :mrjob-opt:`python_bin`.
-
-    This takes precedence over :mrjob-opt:`python_bin` and
-    :mrjob-opt:`steps_python_bin`.
-
 .. mrjob-opt::
     :config: python_bin
     :switch: --python-bin
@@ -324,11 +278,22 @@ Job execution context
     If you're on Python 2, this defaults to ``'python'`` (except on EMR
     AMIs prior to 4.3.0, where it will be ``'python2.7'``).
 
+    Likewise, if you're using PyPy, this defaults to ``'pypy'`` or ``'pypy3'``
+    depending on your version.
+
     This option also affects which Python binary is used for file locking in
-    :mrjob-opt:`setup` scripts, so it might be useful to set even if you're
-    using a non-Python :mrjob-opt:`interpreter` (deprecated). It's also
+    :mrjob-opt:`setup` scripts. It's also
     used by :py:class:`~mrjob.emr.EMRJobRunner` to compile mrjob after
     bootstrapping it (see :mrjob-opt:`bootstrap_mrjob`).
+
+    .. versionchanged:: 0.6.10
+
+       added ``'pypy'`` and ``'pypy3'`` as possible defaults
+
+    .. note::
+
+       mrjob does not auto-install PyPy for you on EMR; see
+       :ref:`installing-pypy-on-emr` for how to do this
 
 .. mrjob-opt::
     :config: setup
@@ -370,13 +335,23 @@ Job execution context
     You may optionally put a ``/`` after *name* as well
     (e.g. ``cd src-tree/#/subdir``).
 
-    This works for Spark as well when running on YARN. The setup script
-    is run before every executor, but only run before the driver in
+    This works for Spark as well (except on the ``local[*]`` master,
+    where it doesn't make sense). The setup
+    script is run before every executor, but only run before the driver in
     cluster mode.
 
-    .. versionadded:: 0.5.8 support for directories (above)
+    .. note::
 
-    .. versionadded:: 0.6.7 support for Spark on YARN
+       Uploading archives and directories (e.g. ``src-tree/#``) to Spark's
+       working directory still only works on YARN.
+
+    .. versionchanged:: 0.6.8
+
+       added full support for Spark
+
+    .. versionchanged:: 0.6.7
+
+       added support for Spark on YARN only
 
     For more details of parsing, see
     :py:func:`~mrjob.setup.parse_setup_cmd`.
@@ -401,52 +376,14 @@ Job execution context
     one command into another (see e.g.
     :py:meth:`~mrjob.job.MRJob.mapper_pre_filter`).
 
-    .. versionchanged:: 0.5.9
+    .. versionchanged:: 0.6.8
 
-       Starting with EMR AMI 5.2.0, :command:`/bin/sh -e` is broken, so we
-       emulate the :command:`-e` switch by using :command:`/bin/sh -x` as our
-       shell, and prepending :command:`set -e` to any shell script generated
-       by mrjob. :command:`set -e` is not prepended if you
-       set *sh_bin* yourself; you could add it with :mrjob-opt:`setup`.
+       Setting this to an empty value (``--sh-bin ''``) means to use the
+       default (used to cause an error).
 
     .. versionchanged:: 0.6.7
 
        Used to be :command:`sh -ex` on local and Hadoop runners
-
-.. mrjob-opt::
-    :config: steps_interpreter
-    :switch: --steps-interpreter
-    :type: :ref:`command <data-type-command>`
-    :set: all
-    :default: current Python interpreter
-
-    .. deprecated:: 0.6.7
-
-       support for non-Python jobs is being phased out.
-
-    Alternate (non-Python) command to use to query the job about
-    its steps. Usually it's good enough to set :mrjob-opt:`interpreter`.
-
-    If you want to use an alternate Python command to get the job's steps,
-    use :mrjob-opt:`steps_python_bin`.
-
-    This takes precedence over :mrjob-opt:`steps_python_bin`.
-
-.. mrjob-opt::
-    :config: steps_python_bin
-    :switch: --steps-python-bin
-    :type: :ref:`command <data-type-command>`
-    :set: all
-    :default: (current Python interpreter)
-
-    .. deprecated:: 0.6.7
-
-       In most cases, runners no longer query jobs for steps, so this
-       does nothing.
-
-    Name/path of alternate python binary to use to query the job about its
-    steps. Rarely needed. If not set, we use ``sys.executable`` (the current
-    Python interpreter).
 
 .. mrjob-opt::
     :config: task_python_bin
@@ -456,7 +393,7 @@ Job execution context
     :default: same as :mrjob-opt:`python_bin`
 
     Name/path of alternate python binary to run the job (invoking it with
-    ``--mapper``, ``--spark`` or anything other than ``--steps``).
+    ``--mapper``, ``--reducer``, ``--spark``, etc.).
 
     In most cases, you're better off setting :mrjob-opt:`python_bin`, which
     this defaults to. This option exists mostly to support running tasks
@@ -540,4 +477,3 @@ as a subprocess:
 * :mrjob-opt:`python_bin`
 * :mrjob-opt:`read_logs`
 * :mrjob-opt:`setup`
-* :mrjob-opt:`steps_python_bin`

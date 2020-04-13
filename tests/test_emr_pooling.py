@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 # Copyright 2009-2016 Yelp and Contributors
-# Copyright 2017 Yelp
-# Copyright 2018 Yelp
+# Copyright 2017-2018 Yelp
+# Copyright 2019 Yelp
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -17,8 +17,9 @@
 """Tests of EMRJobRunner's cluster pooling."""
 import json
 import os
-import os.path
 from datetime import timedelta
+from os.path import join
+from shutil import make_archive
 
 import mrjob
 import mrjob.emr
@@ -576,17 +577,17 @@ class PoolMatchingTestCase(MockBoto3TestCase):
 
     def test_master_alone_requires_big_enough_core_instances(self):
         _, cluster_id = self.make_pooled_cluster(
-            master_instance_type='c1.xlarge',
-            num_core_instances=2)  # core instances are c1.medium
+            master_instance_type='c3.4xlarge',
+            num_core_instances=2)  # core instances are m5.xlarge
 
         self.assertDoesNotJoin(cluster_id, [
             '-r', 'emr', '-v', '--pool-clusters',
-            '--master-instance-type', 'c1.xlarge'])
+            '--master-instance-type', 'c3.4xlarge'])
 
     def test_master_alone_requires_big_enough_master_when_with_core(self):
         _, cluster_id = self.make_pooled_cluster(
             core_instance_type='c1.xlarge',
-            num_core_instances=2)  # master instances are c1.medium
+            num_core_instances=2)  # master instances are m5.xlarge
 
         self.assertDoesNotJoin(cluster_id, [
             '-r', 'emr', '-v', '--pool-clusters',
@@ -766,7 +767,7 @@ class PoolMatchingTestCase(MockBoto3TestCase):
             EbsConfiguration=ebs_config,
             InstanceRole=role,
             InstanceCount=1,
-            InstanceType='m4.large',
+            InstanceType='m5.xlarge',
         )
 
     def test_can_join_cluster_with_same_ebs_config(self):
@@ -1050,7 +1051,7 @@ class PoolMatchingTestCase(MockBoto3TestCase):
         _, cluster_id = self.make_pooled_cluster(
             core_instance_bid_price='0.25',
             task_instance_bid_price='25.00',
-            task_instance_type='c3.2xlarge',
+            task_instance_type='c3.4xlarge',
             num_core_instances=2,
             num_task_instances=3)
 
@@ -1745,7 +1746,7 @@ class PoolMatchingTestCase(MockBoto3TestCase):
             '--bootstrap', 'true'])
 
     def test_dont_join_differently_bootstrapped_pool_2(self):
-        bootstrap_path = os.path.join(self.tmp_dir, 'go.sh')
+        bootstrap_path = join(self.tmp_dir, 'go.sh')
         with open(bootstrap_path, 'w') as f:
             f.write('#!/usr/bin/sh\necho "hi mom"\n')
 
@@ -1754,6 +1755,65 @@ class PoolMatchingTestCase(MockBoto3TestCase):
         self.assertDoesNotJoin(cluster_id, [
             '-r', 'emr', '-v', '--pool-clusters',
             '--bootstrap-action', bootstrap_path + ' a b c'])
+
+    def test_bootstrap_file_contents(self):
+        story_path = self.makefile('story.txt', b'Once upon a time')
+
+        true_story = 'true %s#' % story_path
+
+        _, cluster_id = self.make_pooled_cluster(bootstrap=[true_story])
+
+        # same bootstrap command, same file (matches)
+        self.assertJoins(cluster_id, [
+            '-r', 'emr', '--pool-clusters',
+            '--bootstrap', true_story])
+
+        # same command, different file path with same contents (matches)
+        story_2_path = self.makefile('story-2.txt', b'Once upon a time')
+        self.assertNotEqual(story_2_path, story_path)
+
+        true_story_2 = 'true %s#story.txt' % story_2_path
+
+        self.assertJoins(cluster_id, [
+            '-r', 'emr', '--pool-clusters',
+            '--bootstrap', true_story_2])
+
+        # same command, same file path, different contents (does not match)
+        with open(story_path, 'wb') as f:
+            f.write(b'Call me Ishmael.')  # same file size, different letters
+
+        self.assertDoesNotJoin(cluster_id, [
+            '-r', 'emr', '--pool-clusters',
+            '--bootstrap', true_story])
+
+    def test_bootstrap_archive_contents(self):
+        story_dir = self.makedirs('story')
+        self.makefile(join(story_dir, 'fairy.txt'), b'Once upon a time')
+        self.makefile(join(story_dir, 'moby.txt'), b'Call me Ishmael.')
+
+        empty_dir = self.makedirs('empty')
+
+        story_path = make_archive(join(self.tmp_dir, 'story'),
+                                     'gztar', story_dir)
+
+        true_story = 'true %s#/' % story_path
+
+        _, cluster_id = self.make_pooled_cluster(bootstrap=[true_story])
+
+        self.assertJoins(cluster_id, [
+            '-r', 'emr', '--pool-clusters',
+            '--bootstrap', true_story])
+
+        os.remove(story_path)
+
+        empty_story_path = make_archive(join(self.tmp_dir, 'story'),
+                                        'gztar', empty_dir)
+
+        self.assertEqual(story_path, empty_story_path)
+
+        self.assertDoesNotJoin(cluster_id, [
+            '-r', 'emr', '--pool-clusters',
+            '--bootstrap', true_story])
 
     def test_pool_contention(self):
         _, cluster_id = self.make_pooled_cluster('robert_downey_jr')
@@ -2060,8 +2120,8 @@ class PoolingRecoveryTestCase(MockBoto3TestCase):
         job.sandbox()
 
         with job.make_runner() as runner:
-            self.assertTrue(runner._hadoop_fs)
-            self.assertEqual(runner._hadoop_fs._hadoop_bin, [])
+            self.assertTrue(hasattr(runner.fs, 'hadoop'))
+            self.assertEqual(runner.fs.hadoop._hadoop_bin, [])
 
             runner.run()
 
@@ -2075,9 +2135,9 @@ class PoolingRecoveryTestCase(MockBoto3TestCase):
             self.assertEqual(ssh_tunnel_cluster_ids,
                              [cluster_id, runner.get_cluster_id()])
 
-            self.assertNotEqual(runner._hadoop_fs._hadoop_bin, [])
+            self.assertNotEqual(runner.fs.hadoop._hadoop_bin, [])
             self.assertIn('hadoop@%s-master' % runner.get_cluster_id(),
-                          runner._hadoop_fs._hadoop_bin)
+                          runner.fs.hadoop._hadoop_bin)
 
     def test_join_pooled_cluster_after_self_termination(self):
         # cluster 1 should be preferable
@@ -2227,7 +2287,9 @@ class S3LockTestCase(MockBoto3TestCase):
 
         self.assertEqual(
             True,
-            _attempt_to_acquire_lock(runner.fs, self.LOCK_URI, 5.0, 'job_one'))
+            _attempt_to_acquire_lock(
+                runner.fs.s3, self.LOCK_URI, 5.0, 'job_one')
+        )
 
         self.sleep.assert_called_with(5.0)
 
@@ -2235,7 +2297,9 @@ class S3LockTestCase(MockBoto3TestCase):
 
         self.assertEqual(
             False,
-            _attempt_to_acquire_lock(runner.fs, self.LOCK_URI, 5.0, 'job_two'))
+            _attempt_to_acquire_lock(
+                runner.fs.s3, self.LOCK_URI, 5.0, 'job_two')
+        )
 
         self.assertFalse(self.sleep.called)
 
@@ -2248,8 +2312,9 @@ class S3LockTestCase(MockBoto3TestCase):
         }}, age=timedelta(minutes=30))
 
         did_lock = _attempt_to_acquire_lock(
-            runner.fs, 's3://locks/expired_lock', 5.0, 'job_one',
-            seconds_to_expiration=300)
+            runner.fs.s3, 's3://locks/expired_lock', 5.0, 'job_one',
+            mins_to_expiration=5)
+
         self.assertEqual(True, did_lock)
 
         self.sleep.assert_called_with(5.0)
@@ -2263,10 +2328,10 @@ class S3LockTestCase(MockBoto3TestCase):
 
         self.assertRaises(
             StopIteration, _attempt_to_acquire_lock,
-            runner.fs, self.LOCK_URI, 5.0, 'job_one')
+            runner.fs.s3, self.LOCK_URI, 5.0, 'job_one')
 
         did_lock = _attempt_to_acquire_lock(
-            runner.fs, self.LOCK_URI, 5.0, 'job_two')
+            runner.fs.s3, self.LOCK_URI, 5.0, 'job_two')
         self.assertFalse(did_lock)
 
     def test_read_race_condition(self):
@@ -2275,13 +2340,13 @@ class S3LockTestCase(MockBoto3TestCase):
         runner = EMRJobRunner(conf_paths=[])
 
         def _while_you_were_sleeping(*args, **kwargs):
-            key = runner.fs._get_s3_key(self.LOCK_URI)
+            key = runner.fs.s3._get_s3_key(self.LOCK_URI)
             key.put(b'job_two')
 
         self.sleep.side_effect = _while_you_were_sleeping
 
         did_lock = _attempt_to_acquire_lock(
-            runner.fs, self.LOCK_URI, 5.0, 'job_one')
+            runner.fs.s3, self.LOCK_URI, 5.0, 'job_one')
         self.assertFalse(did_lock)
 
         self.sleep.assert_called_with(5.0)

@@ -2,6 +2,7 @@
 # Copyright 2013 David Marin and Lyft
 # Copyright 2014-2016 Yelp and Contributors
 # Copyright 2017 Yelp
+# Copyright 2019 Yelp
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -94,8 +95,6 @@ def parse_setup_cmd(cmd):
     on the remote system. The trailing slash will also be kept as part of
     the original command. You may optionally include a slash after *name* as
     well (this will only result in a single slash in the final command).
-
-    .. versionadded:: 0.5.8 support for directories (above)
 
     Parsed hash paths are dicitionaries with the keys ``path``, ``name``, and
     ``type`` (either ``'file'``, ``'archive'``, or ``'dir'``).
@@ -340,8 +339,8 @@ class UploadDirManager(object):
 
 
 class WorkingDirManager(object):
-    """Represents the working directory of hadoop tasks (or bootstrap
-    commands on EMR).
+    """Represents the working directory of hadoop/Spark tasks (or bootstrap
+    commands in the cloud).
 
     To support Hadoop's distributed cache, paths can be for ordinary
     files, or for archives (which are automatically uncompressed into
@@ -432,7 +431,7 @@ class WorkingDirManager(object):
 
         return self._typed_path_to_auto_name[(type, path)]
 
-    def name_to_path(self, type):
+    def name_to_path(self, type=None):
         """Get a map from name (in the setup directory) to path for
         all known files/archives, so we can build :option:`-file` and
         :option:`-archive` options to Hadoop (or fake them in a bootstrap
@@ -440,23 +439,29 @@ class WorkingDirManager(object):
 
         :param type: either ``'archive'`` or ``'file'``
         """
-        self._check_type(type)
+        if type is not None:
+            self._check_type(type)
 
         for path_type, path in self._typed_path_to_auto_name:
-            if path_type == type:
-                self.name(type, path)
+            if type is None or path_type == type:
+                self.name(path_type, path)
 
         return dict((name, typed_path[1])
                     for name, typed_path
                     in self._name_to_typed_path.items()
-                    if typed_path[0] == type)
+                    if (type is None or typed_path[0] == type))
 
-    def paths(self):
+    def paths(self, type=None):
         """Get a set of all paths tracked by this WorkingDirManager."""
         paths = set()
 
-        paths.update(p for (t, p) in self._typed_path_to_auto_name)
-        paths.update(p for (t, p) in self._name_to_typed_path.values())
+        for path_type, path in self._typed_path_to_auto_name:
+            if type is None or path_type == type:
+                paths.add(path)
+
+        for path_type, path in self._name_to_typed_path.values():
+            if type is None or path_type == type:
+                paths.add(path)
 
         return paths
 

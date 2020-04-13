@@ -1,6 +1,6 @@
 # Copyright 2009-2016 Yelp and Contributors
-# Copyright 2017 Yelp
-# Copyright 2018 Yelp
+# Copyright 2017-2018 Yelp
+# Copyright 2019 Yelp
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -27,10 +27,10 @@ except ImportError:
 
 try:
     import boto3
+    import boto3.s3.transfer
     boto3  # quiet "redefinition of unused ..." warning from pyflakes
 except ImportError:
     boto3 = None
-
 
 from mrjob.aws import _client_error_status
 from mrjob.aws import _S3_REGION_WITH_NO_LOCATION_CONSTRAINT
@@ -46,7 +46,8 @@ from mrjob.runner import GLOB_RE
 
 log = logging.getLogger(__name__)
 
-_CHUNK_SIZE = 8192
+# used to disable multipart upload
+_HUGE_PART_SIZE = 2 ** 256
 
 
 def _endpoint_url(host_or_uri):
@@ -74,25 +75,29 @@ class S3Filesystem(Filesystem):
     ``EMRJobRunner().fs``, composed with
     :py:class:`~mrjob.fs.ssh.SSHFilesystem` and
     :py:class:`~mrjob.fs.local.LocalFilesystem`.
-    """
 
+    :param aws_access_key_id: Your AWS access key ID
+    :param aws_secret_access_key: Your AWS secret access key
+    :param aws_session_token: session token for use with temporary
+                              AWS credentials
+    :param s3_endpoint: If set, always use this endpoint
+    :param s3_region: Default region for connections to the S3 API and
+                      newly created buckets.
+    :param part_size: Part size for multi-part uploading, in bytes, or
+                      ``None``
+
+    .. versionchanged:: 0.6.8 added *part_size*
+    """
     def __init__(self, aws_access_key_id=None, aws_secret_access_key=None,
-                 aws_session_token=None, s3_endpoint=None, s3_region=None):
-        """
-        :param aws_access_key_id: Your AWS access key ID
-        :param aws_secret_access_key: Your AWS secret access key
-        :param aws_session_token: session token for use with temporary
-                                   AWS credentials
-        :param s3_endpoint: If set, always use this endpoint
-        :param s3_region: Region name corresponding to s3_endpoint. Only used
-                          if *s3_endpoint* is set
-        """
+                 aws_session_token=None, s3_endpoint=None, s3_region=None,
+                 part_size=None):
         super(S3Filesystem, self).__init__()
         self._s3_endpoint_url = _endpoint_url(s3_endpoint)
         self._s3_region = s3_region
         self._aws_access_key_id = aws_access_key_id
         self._aws_secret_access_key = aws_secret_access_key
         self._aws_session_token = aws_session_token
+        self._part_size = part_size
 
     def can_handle_path(self, path):
         return is_s3_uri(path)
@@ -107,12 +112,6 @@ class S3Filesystem(Filesystem):
         *path_glob* can include ``?`` to match single characters or
         ``*`` to match 0 or more characters. Both ``?`` and ``*`` can match
         ``/``.
-
-        .. versionchanged:: 0.5.0
-
-            You no longer need a trailing slash to list "directories" on S3;
-            both ``ls('s3://b/dir')`` and `ls('s3://b/dir/')` will list
-            all keys starting with ``dir/``.
         """
         for uri, key in self._ls(path_glob):
             yield uri
@@ -166,18 +165,12 @@ class S3Filesystem(Filesystem):
             raise IOError('Key %r does not exist' % (path,))
         return k.e_tag.strip('"')
 
-    def _cat_file(self, filename):
+    def _cat_file(self, path):
         # stream lines from the s3 key
-        s3_key = self._get_s3_key(filename)
+        s3_key = self._get_s3_key(path)
         body = s3_key.get()['Body']
 
-        return decompress(body, filename)
-
-    def mkdir(self, dest):
-        """Make a directory. This does nothing on S3 because there are
-        no directories.
-        """
-        pass
+        return decompress(body, path)
 
     def exists(self, path_glob):
         """Does the given path exist?
@@ -188,16 +181,48 @@ class S3Filesystem(Filesystem):
         # just fall back on _ls(); it's smart
         return any(self._ls(path_glob))
 
+    def mkdir(self, path):
+        """Make a directory. This doesn't actually create directories on S3
+        (because there is no such thing), but it will create the corresponding
+        bucket if it doesn't exist.
+        """
+        bucket_name, key_name = parse_s3_uri(path)
+
+        client = self.make_s3_client()
+
+        try:
+            client.head_bucket(Bucket=bucket_name)
+        except botocore.exceptions.ClientError as ex:
+            if _client_error_status(ex) != 404:
+                raise
+
+            self.create_bucket(bucket_name)
+
+    def put(self, src, path):
+        """Uploads a local file to a specific destination."""
+        s3_key = self._get_s3_key(path)
+
+        # if part_size is None or 0, disable multipart upload
+        part_size = self._part_size or _HUGE_PART_SIZE
+
+        s3_key.upload_file(
+            src,
+            Config=boto3.s3.transfer.TransferConfig(
+                multipart_chunksize=part_size,
+                multipart_threshold=part_size,
+            ),
+        )
+
     def rm(self, path_glob):
         """Remove all files matching the given glob."""
         for uri, key in self._ls(path_glob):
             log.debug('deleting ' + uri)
             key.delete()
 
-    def touchz(self, dest):
+    def touchz(self, path):
         """Make an empty file in the given location. Raises an error if
         a non-empty file already exists in that location."""
-        key = self._get_s3_key(dest)
+        key = self._get_s3_key(path)
 
         data = None
         try:
@@ -208,7 +233,7 @@ class S3Filesystem(Filesystem):
                 raise
 
         if data and data['ContentLength'] != 0:
-            raise OSError('Non-empty file %r already exists!' % (dest,))
+            raise OSError('Non-empty file %r already exists!' % (path,))
 
         key.put(Body=b'')
 
@@ -235,8 +260,6 @@ class S3Filesystem(Filesystem):
         It's best to use :py:meth:`get_bucket` because it chooses the
         appropriate S3 endpoint automatically. If you are trying to get
         bucket metadata, use :py:meth:`make_s3_client`.
-
-        .. versionadded:: 0.6.0
         """
         # give a non-cryptic error message if boto3 isn't installed
         if boto3 is None:
@@ -257,8 +280,6 @@ class S3Filesystem(Filesystem):
         wrapped in a :py:class:`mrjob.retry.RetryWrapper`
 
         :param region: region to use to choose S3 endpoint.
-
-        .. versionadded:: 0.6.0
         """
         # give a non-cryptic error message if boto3 isn't installed
         if boto3 is None:
@@ -314,8 +335,6 @@ class S3Filesystem(Filesystem):
     def get_all_bucket_names(self):
         """Get a list of the names of all buckets owned by this user
         on S3.
-
-        .. versionadded:: 0.6.0
         """
         c = self.make_s3_client()
         return [b['Name'] for b in c.list_buckets()['Buckets']]
@@ -323,19 +342,24 @@ class S3Filesystem(Filesystem):
     def create_bucket(self, bucket_name, region=None):
         """Create a bucket on S3 with a location constraint
         matching the given region.
-
-        .. versionchanged:: 0.6.0
-
-           The *region* argument used to be called *location*.
         """
         client = self.make_s3_client()
 
         params = dict(Bucket=bucket_name)
 
+        if region is None:
+            region = self._s3_region
+
         # CreateBucketConfiguration can't be empty, so don't set it
         # unless there's a location constraint (see #1927)
-        if region != _S3_REGION_WITH_NO_LOCATION_CONSTRAINT:
+        if region and region != _S3_REGION_WITH_NO_LOCATION_CONSTRAINT:
             params['CreateBucketConfiguration'] = dict(
                 LocationConstraint=region)
 
         client.create_bucket(**params)
+
+
+def _is_permanent_boto3_error(ex):
+    """Used to disable S3Filesystem when boto3 is installed but
+    credentials aren't set up."""
+    return isinstance(ex, botocore.exceptions.NoCredentialsError)

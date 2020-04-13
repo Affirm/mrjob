@@ -79,10 +79,10 @@ class YarnEMRJobRunnerEndToEndTestCase(YarnEMRJobRunnerTestBase):
             runner._wait_for_cluster = Mock()
 
             # mock ssh
-            runner.fs._ssh_run = Mock()
+            runner.fs.ssh._ssh_run = Mock()
             mock_stderr = b'whooo stderr Submitting application application_1'\
                           b'550537538614_0001 to ResourceManager stderr logs'
-            runner.fs._ssh_run.return_value = ('meh stdour', mock_stderr)
+            runner.fs.ssh._ssh_run.return_value = ('meh stdout', mock_stderr)
 
             runner._get_application_info = Mock()
             runner._get_application_info.side_effect = [
@@ -145,6 +145,8 @@ class YarnEMRJobRunnerClusterLaunchTestCase(YarnEMRJobRunnerTestBase):
         runner._check_cluster_state.return_value = \
             5 if state_ret_val else -1
         # return it
+        runner._prepare_for_launch()
+
         return runner
 
     def test_valid_cluster_find(self):

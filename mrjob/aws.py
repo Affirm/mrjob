@@ -2,7 +2,7 @@
 # Copyright 2013 Lyft
 # Copyright 2015-2016 Yelp
 # Copyright 2017 Yelp and Contributors
-# Copyright 2019 Yelp
+# Copyright 2019 Yelp and Contributors
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -258,11 +258,13 @@ def _is_retriable_client_error(ex):
 def _wrap_aws_client(raw_client, min_backoff=None):
     """Wrap a given boto3 Client object so that it can retry when
     throttled."""
-    return RetryWrapper(raw_client,
-                        retry_if=_is_retriable_client_error,
-                        initial_backoff=min_backoff or _AWS_BACKOFF,
-                        multiplier=_AWS_BACKOFF_MULTIPLIER,
-                        max_tries=_AWS_MAX_TRIES)
+    return RetryWrapper(
+        raw_client,
+        retry_if=_is_retriable_client_error,
+        backoff=max(_AWS_BACKOFF, min_backoff or 0),
+        multiplier=_AWS_BACKOFF_MULTIPLIER,
+        max_tries=_AWS_MAX_TRIES,
+        unwrap_methods={'get_paginator'})
 
 
 def _boto3_now():
@@ -293,16 +295,7 @@ def _boto3_paginate(what, boto3_client, api_call, **api_params):
 
     paginator = boto3_client.get_paginator(api_call)
 
-    # We wrap the pagination object itself so that all the paginator's request
-    # method is  retried in the background; otherwise the generator will fail
-    # on the first retriable exception.
-    paginator_generator = paginator.paginate(**api_params)
-    if isinstance(boto3_client, RetryWrapper):
-        current_backoff = boto3_client._RetryWrapper__initial_backoff
-        paginator_generator = _wrap_aws_client(paginator_generator,
-                                               min_backoff=current_backoff)
-
-    for page in paginator_generator:
+    for page in paginator.paginate(**api_params):
         if _delay:
             time.sleep(_delay)
 

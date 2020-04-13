@@ -1,5 +1,6 @@
 # Copyright 2009-2012 Yelp
 # Copyright 2015-2018 Yelp
+# Copyright 2019 Yelp
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -24,6 +25,10 @@ Options::
   -c CONF_PATHS, --conf-path CONF_PATHS
                         Path to alternate mrjob.conf file to read from
   --no-conf             Don't load mrjob.conf even if it's available
+  --ec2-endpoint EC2_ENDPOINT
+                        Force mrjob to connect to EC2 on this endpoint (e.g.
+                        ec2.us-west-1.amazonaws.com). Default is to infer this
+                        from region.
   --ec2-key-pair-file EC2_KEY_PAIR_FILE
                         Path to file containing SSH key for EMR
   --emr-endpoint EMR_ENDPOINT
@@ -118,7 +123,7 @@ def _run_on_all_nodes(runner, output_dir, cmd_args, print_stderr=True):
 
     for addr in addresses:
 
-        stdout, stderr = runner.fs._ssh_run(addr, cmd_args)
+        stdout, stderr = runner.fs.ssh._ssh_run(addr, cmd_args)
 
         if print_stderr:
             print('---')

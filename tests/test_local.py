@@ -2,6 +2,7 @@
 # Copyright 2013 David Marin and Lyft
 # Copyright 2015-2017 Yelp
 # Copyright 2018 Yelp and Contributors
+# Copyright 2019 Yelp
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -29,17 +30,25 @@ from unittest import skipIf
 
 from warcio.warcwriter import WARCWriter
 
+try:
+    import pyspark
+except ImportError:
+    pyspark = None
+
 import mrjob
 from mrjob.cat import decompress
 from mrjob.examples.mr_phone_to_url import MRPhoneToURL
-from mrjob.launch import MRJobLauncher
+from mrjob.examples.mr_spark_wordcount import MRSparkWordcount
+from mrjob.examples.mr_spark_wordcount_script import MRSparkScriptWordcount
+from mrjob.examples.mr_sparkaboom import MRSparKaboom
 from mrjob.local import LocalMRJobRunner
 from mrjob.local import _sort_lines_in_memory
+from mrjob.parse import is_uri
 from mrjob.step import StepFailedException
 from mrjob.util import cmd_line
+from mrjob.util import safeeval
 from mrjob.util import to_lines
 
-import tests.sr_wc
 from tests.examples.test_mr_phone_to_url import write_conversion_record
 from tests.job import run_job
 from tests.mr_cmd_job import MRCmdJob
@@ -49,8 +58,9 @@ from tests.mr_filter_job import MRFilterJob
 from tests.mr_group import MRGroup
 from tests.mr_job_where_are_you import MRJobWhereAreYou
 from tests.mr_just_a_jar import MRJustAJar
-from tests.mr_null_spark import MRNullSpark
 from tests.mr_sort_and_group import MRSortAndGroup
+from tests.mr_spark_os_walk import MRSparkOSWalk
+from tests.mr_stdin_only import MRStdinOnly
 from tests.mr_two_step_job import MRTwoStepJob
 from tests.mr_word_count import MRWordCount
 from tests.py2 import call
@@ -64,19 +74,6 @@ from tests.test_sim import LocalFSTestCase
 from tests.test_sim import SimRunnerJobConfTestCase
 from tests.test_sim import SimRunnerNoMapperTestCase
 from tests.test_sim import SortValuesTestCase
-
-
-def _bash_wrap(cmd_str):
-    """Escape single quotes in a shell command string and wrap it with ``bash
-    -c '<string>'``.
-
-    This low-tech replacement works because we control the surrounding string
-    and single quotes are the only character in a single-quote string that
-    needs escaping.
-
-    .. deprecated:: 0.5.8
-    """
-    return "bash -c '%s'" % cmd_str.replace("'", "'\\''")
 
 
 class LocalMRJobRunnerEndToEndTestCase(SandboxedTestCase):
@@ -254,8 +251,7 @@ class PythonBinTestCase(EmptyMrjobConfTestCase):
         # "echo" is a pretty poor substitute for Python, but it
         # should be available on most systems
         mr_job = MRTwoStepJob(
-            ['--python-bin', 'echo', '--steps-python-bin', sys.executable,
-             '--no-conf', '-r', 'local'])
+            ['--python-bin', 'echo', '--no-conf', '-r', 'local'])
         mr_job.sandbox()
 
         with mr_job.make_runner() as runner:
@@ -298,39 +294,6 @@ class PythonBinTestCase(EmptyMrjobConfTestCase):
                 sorted([b'1\tnull\n', b'1\t"bar"\n']))
 
 
-class StepsPythonBinTestCase(BasicTestCase):
-
-    def test_echo_as_steps_python_bin(self):
-        mr_job = MRTwoStepJob(
-            ['--steps', '--steps-python-bin', 'echo', '--no-conf',
-             '-r', 'local'])
-        mr_job.sandbox()
-
-        with mr_job.make_runner() as runner:
-            assert isinstance(runner, LocalMRJobRunner)
-            # MRTwoStepJob populates _steps in the runner, so un-populate
-            # it here so that the runner actually tries to get the steps
-            # via subprocess
-            runner._steps = None
-            self.assertRaises(ValueError, runner._get_steps)
-
-    def test_echo_as_steps_interpreter(self):
-        import logging
-        logging.basicConfig()
-        mr_job = MRTwoStepJob(
-            ['--steps', '--steps-interpreter', 'echo', '--no-conf', '-r',
-             'local'])
-        mr_job.sandbox()
-
-        with mr_job.make_runner() as runner:
-            assert isinstance(runner, LocalMRJobRunner)
-            # MRTwoStepJob populates _steps in the runner, so un-populate
-            # it here so that the runner actually tries to get the steps
-            # via subprocess
-            runner._steps = None
-            self.assertRaises(ValueError, runner._get_steps)
-
-
 class LocalBootstrapMrjobTestCase(BasicTestCase):
 
     def test_loading_bootstrapped_mrjob_library(self):
@@ -350,11 +313,11 @@ class LocalBootstrapMrjobTestCase(BasicTestCase):
 
                 runner.run()
 
-                output = list(to_lines(runner.cat_output()))
+                output = list(mr_job.parse_output((runner.cat_output())))
                 self.assertEqual(len(output), 1)
 
                 # script should load mrjob from its working dir
-                _, script_mrjob_dir = mr_job.parse_output_line(output[0])
+                _, script_mrjob_dir = output[0]
 
                 self.assertNotEqual(our_mrjob_dir, script_mrjob_dir)
                 self.assertTrue(script_mrjob_dir.startswith(local_tmp_dir))
@@ -505,7 +468,7 @@ class CommandSubstepTestCase(SandboxedTestCase):
         with gzip.open(x_gz_path, 'wb') as x_gz:
             x_gz.write(b'x\nx\nx\nx\nx\nx\n')
 
-        reducer_cmd = _bash_wrap('wc -l | tr -Cd "[:digit:]"')
+        reducer_cmd = '/bin/sh -c \'wc -l | tr -Cd "[:digit:]"\''
         job = MRCmdJob([
             '--runner', 'local',
             '--mapper-cmd', 'cat -e',
@@ -764,6 +727,25 @@ class SortBinTestCase(SandboxedTestCase):
 
         self.assertEqual(sort_args[:2], ['sort', '-r'])
 
+    def test_empty_sort_bin_means_default(self):
+        job = MRGroup(['-r', 'local', '--sort-bin', ''])
+        job.sandbox(stdin=BytesIO(
+            b'apples\nbuffaloes\nbears'))
+
+        with job.make_runner() as runner:
+            runner.run()
+
+            self.assertEqual(
+                sorted(job.parse_output(runner.cat_output())),
+                [('a', ['apples']), ('b', ['buffaloes', 'bears'])])
+
+        self.assertTrue(self.check_call.called)
+        self.assertFalse(self._sort_lines_in_memory.called)
+
+        sort_args = self.check_call.call_args[0][0]
+        self.assertEqual(sort_args[:6],
+                         ['sort', '-t', '\t', '-k', '1,1', '-s'])
+
     def test_sort_in_memory_on_windows(self):
         self.start(patch('platform.system', return_value='Windows'))
 
@@ -843,26 +825,6 @@ class SortBinTestCase(SandboxedTestCase):
         self._test_environment_variables('--local-tmp-dir', tmp_dir)
 
 
-class InputFileArgsTestCase(SandboxedTestCase):
-    # test for #567: ensure that local runner doesn't need to pass
-    # file args to jobs
-
-    def test_no_file_args_required(self):
-        words1 = self.makefile('words1', b'kit and caboodle\n')
-        words2 = self.makefile('words2', b'baubles\nbangles and beads\n')
-
-        job = MRJobLauncher(
-            args=['-r', 'local', tests.sr_wc.__file__, words1, words2])
-        job.sandbox()
-
-        with job.make_runner() as runner:
-            runner.run()
-
-            lines = list(to_lines(runner.cat_output()))
-            self.assertEqual(len(lines), 1)
-            self.assertEqual(int(lines[0]), 7)
-
-
 class LocalInputManifestTestCase(InlineInputManifestTestCase):
 
     RUNNER = 'local'
@@ -894,13 +856,6 @@ class LocalInputManifestTestCase(InlineInputManifestTestCase):
 
 class UnsupportedStepsTestCase(SandboxedTestCase):
 
-    def test_no_spark_steps(self):
-        # just a sanity check; _STEP_TYPES is tested in a lot of ways
-        job = MRNullSpark(['-r', 'local'])
-        job.sandbox()
-
-        self.assertRaises(NotImplementedError, job.make_runner)
-
     def test_no_jar_steps(self):
         jar_path = self.makefile('dora.jar')
 
@@ -908,3 +863,155 @@ class UnsupportedStepsTestCase(SandboxedTestCase):
         job.sandbox()
 
         self.assertRaises(NotImplementedError, job.make_runner)
+
+
+class SparkMasterTestCase(SandboxedTestCase):
+
+    def test_default_spark_master(self):
+        runner = LocalMRJobRunner()
+
+        self.assertEqual(runner._spark_master(),
+                         'local-cluster[%d,1,1024]' % cpu_count())
+
+    def test_num_cores(self):
+        runner = LocalMRJobRunner(num_cores=3)
+
+        self.assertEqual(runner._spark_master(),
+                         'local-cluster[3,1,1024]')
+
+    def _test_spark_executor_memory(self, conf_value, megs):
+        runner = LocalMRJobRunner(
+            jobconf={'spark.executor.memory': conf_value})
+
+        self.assertEqual(runner._spark_master(),
+                         'local-cluster[%d,1,%d]' % (
+                             cpu_count(), megs))
+
+    def test_spark_exector_memory_2g(self):
+        self._test_spark_executor_memory('2g', 2048)
+
+    def test_spark_exector_memory_512m(self):
+        self._test_spark_executor_memory('512m', 512)
+
+    def test_spark_exector_memory_512M(self):
+        # test case-insensitivity
+        self._test_spark_executor_memory('512M', 512)
+
+    def test_spark_exector_memory_1t(self):
+        self._test_spark_executor_memory('1t', 1024 * 1024)
+
+    def test_spark_exector_memory_1_billion(self):
+        # should round up
+        self._test_spark_executor_memory('1000000000', 954)
+
+    def test_spark_exector_memory_640000k(self):
+        self._test_spark_executor_memory('640000k', 625)
+
+
+@skipIf(pyspark is None, 'no pyspark module')
+class LocalRunnerSparkTestCase(SandboxedTestCase):
+    # these tests are slow (~30s) because they run on
+    # actual Spark, in local-cluster mode
+
+    def test_spark_mrjob(self):
+        text = b'one fish\ntwo fish\nred fish\nblue fish\n'
+
+        job = MRSparkWordcount(['-r', 'local'])
+        job.sandbox(stdin=BytesIO(text))
+
+        counts = {}
+
+        with job.make_runner() as runner:
+            runner.run()
+
+            for line in to_lines(runner.cat_output()):
+                k, v = safeeval(line)
+                counts[k] = v
+
+        self.assertEqual(counts, dict(
+            blue=1, fish=4, one=1, red=1, two=1))
+
+    def test_spark_job_failure(self):
+        job = MRSparKaboom(['-r', 'local'])
+        job.sandbox(stdin=BytesIO(b'line\n'))
+
+        with job.make_runner() as runner:
+            self.assertRaises(StepFailedException, runner.run)
+
+    def test_spark_script_mrjob(self):
+        text = b'one fish\ntwo fish\nred fish\nblue fish\n'
+
+        job = MRSparkScriptWordcount(['-r', 'local'])
+        job.sandbox(stdin=BytesIO(text))
+
+        counts = {}
+
+        with job.make_runner() as runner:
+            runner.run()
+
+            for line in to_lines(runner.cat_output()):
+                k, v = safeeval(line)
+                counts[k] = v
+
+        self.assertEqual(counts, dict(
+            blue=1, fish=4, one=1, red=1, two=1))
+
+    def test_upload_files_with_rename(self):
+        fish_path = self.makefile('fish', b'salmon')
+        fowl_path = self.makefile('fowl', b'goose')
+
+        job = MRSparkOSWalk(['-r', 'local',
+                             '--files',
+                             '%s#ghoti,%s' % (fish_path, fowl_path)])
+        job.sandbox()
+
+        file_sizes = {}
+
+        with job.make_runner() as runner:
+            runner.run()
+
+            # check working dir mirror
+            wd_mirror = runner._wd_mirror()
+            self.assertIsNotNone(wd_mirror)
+            self.assertFalse(is_uri(wd_mirror))
+
+            self.assertTrue(os.path.exists(wd_mirror))
+            # only files which needed to be renamed should be in wd_mirror
+            self.assertTrue(os.path.exists(os.path.join(wd_mirror, 'ghoti')))
+            self.assertFalse(os.path.exists(os.path.join(wd_mirror, 'fish')))
+            self.assertFalse(os.path.exists(os.path.join(wd_mirror, 'fowl')))
+
+            for line in to_lines(runner.cat_output()):
+                path, size = safeeval(line)
+                file_sizes[path] = size
+
+        # check that files were uploaded to working dir
+        self.assertIn('fowl', file_sizes)
+        self.assertEqual(file_sizes['fowl'], 5)
+
+        self.assertIn('ghoti', file_sizes)
+        self.assertEqual(file_sizes['ghoti'], 6)
+
+        # fish was uploaded as "ghoti"
+        self.assertNotIn('fish', file_sizes)
+
+        # TODO: add a Spark JAR to the repo, so we can test it
+
+
+class InputFileArgsTestCase(SandboxedTestCase):
+    # test for #567: ensure that local runner doesn't need to pass
+    # file args to jobs
+
+    def test_stdin_only(self):
+        input1 = self.makefile('input1', contents='cat cat cat cat cat')
+        input2 = self.makefile('input2', contents='dog dog dog')
+
+        job = MRStdinOnly(['-r', 'local', input1, input2])
+        job.sandbox()
+
+        with job.make_runner() as runner:
+            runner.run()
+
+            output = dict(job.parse_output(runner.cat_output()))
+
+            self.assertEqual(output, dict(cat=5, dog=3))
